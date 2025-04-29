@@ -1,6 +1,15 @@
 # 🏗️ Minifigure Detector
 A machine learning system for detecting and classifying LEGO® minifigures using **computer vision** and **deep learning**.
 
+## 📝 Dependencies
+- **TensorFlow** - Deep Learning  
+- **FastAPI** - API Service  
+- **OpenCV** - Image Processing  
+- **Redis** - Caching  
+🔹 Additional dependencies in `requirements.txt`
+
+---
+
 ## 🎯 Features
 ✅ Automated data collection from LEGO databases  
 ✅ Image preprocessing and augmentation  
@@ -156,14 +165,6 @@ docker-compose run train python scripts/your_script.py
 
 ---
 
-## 📝 Dependencies
-- **TensorFlow** - Deep Learning  
-- **FastAPI** - API Service  
-- **OpenCV** - Image Processing  
-- **Redis** - Caching  
-🔹 Additional dependencies in `requirements.txt`
-
----
 
 ## 🤝 Contributing  
 🔹 Fork the repository  

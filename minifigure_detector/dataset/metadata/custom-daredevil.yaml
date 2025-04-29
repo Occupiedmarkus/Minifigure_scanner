@@ -1,0 +1,16 @@
+minifigure:
+  category: custom
+  image_paths:
+  - dataset/images/train/custom/custom-daredevil/custom-daredevil-001.png
+  - dataset/images/train/custom/custom-daredevil/custom-daredevil-002.png
+  - dataset/images/train/custom/custom-daredevil/custom-daredevil-003.png
+  - dataset/images/train/custom/custom-daredevil/custom-daredevil-004.png
+  - dataset/images/train/custom/custom-daredevil/custom-daredevil-005.png
+  - dataset/images/train/custom/custom-daredevil/custom-daredevil-006.png
+  - dataset/images/train/custom/custom-daredevil/custom-daredevil-007.png
+  - dataset/images/train/custom/custom-daredevil/custom-daredevil-008.png
+  is_custom: true
+  name: daredevil
+  set_num: custom-daredevil
+  theme: custom
+  year: -1

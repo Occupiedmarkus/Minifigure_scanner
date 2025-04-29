@@ -235,7 +235,7 @@ class MinifigureDataCollector:
         """Collect minifigure data with resume capability"""
         try:
             # Create directories if they don't exist
-            for dir_name in ['images', 'metadata', 'labels']:
+            for dir_name in ['images/train', 'metadata', 'labels']:
                 dir_path = self.base_dir / dir_name
                 dir_path.mkdir(parents=True, exist_ok=True)
             
@@ -280,7 +280,7 @@ class MinifigureDataCollector:
             with tqdm(total=len(minifigs), desc="Downloading images") as pbar:
                 for minifig in minifigs:
                     if minifig.get('set_img_url'):
-                        image_path = self.base_dir / 'images' / f"{minifig['set_num']}.jpg"
+                        image_path = self.base_dir / 'images' / 'train'/ f"{minifig['set_num']}.jpg"
                         
                         if not image_path.exists():
                             if self.download_image(minifig['set_img_url'], image_path):
