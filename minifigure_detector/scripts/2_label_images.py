@@ -33,47 +33,26 @@ class MinifigureDataPreprocessor:
         # Initialize label encoders
         self.year_encoder = LabelEncoder()
         self.theme_encoder = LabelEncoder()
-        
     def load_metadata(self):
         """Load and validate all metadata files"""
         metadata_files = list(self.metadata_dir.glob('*.yaml'))
+        self.logger.info(f"Found {len(metadata_files)} metadata files")
+        
+        # Debug: Print all found metadata files
+        for f in metadata_files:
+            self.logger.debug(f"Found metadata file: {f}")
         
         # Check both train directory and custom subdirectory
         standard_images = list(self.images_dir.glob('*.png')) + list(self.images_dir.glob('*.jpg'))
+        self.logger.info(f"Found {len(standard_images)} standard images")
+        
         custom_dir = self.images_dir / 'custom'
-        
         if custom_dir.exists():
-            # Look for custom-(name) directories
             custom_dirs = list(custom_dir.glob('custom-*'))
-            self.logger.info(f"Found {len(custom_dirs)} custom minifigure directories")
-            
-            # Create metadata for custom images if not exists
-            for custom_dir in custom_dirs:
-                minifig_id = custom_dir.name  # e.g., 'custom-batman'
-                metadata_file = self.metadata_dir / f"{minifig_id}.yaml"
-                
-                if not metadata_file.exists():
-                    # Get all images for this custom minifigure
-                    custom_images = list(custom_dir.glob(f'{minifig_id}-*.png')) + \
-                                list(custom_dir.glob(f'{minifig_id}-*.jpg'))
-                    
-                    if custom_images:
-                        metadata = {
-                            'minifigure': {
-                                'set_num': minifig_id,
-                                'name': minifig_id.replace('custom-', ''),
-                                'year': -1,  # Unknown year
-                                'theme': 'custom',
-                                'category': 'custom',
-                                'is_custom': True,
-                                'image_paths': [str(img) for img in sorted(custom_images)]
-                            }
-                        }
-                        with open(metadata_file, 'w') as f:
-                            yaml.dump(metadata, f)
-                        metadata_files.append(metadata_file)
-        
-        self.logger.info(f"Found {len(metadata_files)} total metadata files")
+            self.logger.info(f"Found {len(custom_dirs)} custom directories:")
+            for d in custom_dirs:
+                custom_images = list(d.glob(f'{d.name}-*.png')) + list(d.glob(f'{d.name}-*.jpg'))
+                self.logger.info(f"  - {d.name}: {len(custom_images)} images")
         
         metadata_list = []
         valid_count = 0
@@ -83,12 +62,17 @@ class MinifigureDataPreprocessor:
             try:
                 with open(meta_file, 'r') as f:
                     data = yaml.safe_load(f)
+                    self.logger.debug(f"Loaded metadata content from {meta_file}:")
+                    self.logger.debug(str(data))
                 
+                # Extract minifigure data
                 metadata = data.get('minifigure', data)
                 
                 # Basic validation
                 required_fields = ['set_num', 'name', 'year']
-                if all(field in metadata for field in required_fields):
+                missing_fields = [field for field in required_fields if field not in metadata]
+                
+                if not missing_fields:
                     # Handle year conversion
                     if metadata['year'] == 'unknown':
                         metadata['year'] = -1
@@ -99,35 +83,35 @@ class MinifigureDataPreprocessor:
                             metadata['year'] = -1
                     
                     # Handle different image types
-                    if metadata.get('is_custom'):
-                        # For custom images, use the stored image paths
-                        if 'image_paths' in metadata:
-                            metadata['images'] = [
-                                str(path) for path in metadata['image_paths']
-                                if Path(path).exists()
-                            ]
-                            if metadata['images']:
-                                metadata_list.append(metadata)
-                                valid_count += 1
-                                self.logger.debug(f"Valid custom metadata found for {metadata['set_num']}")
-                            else:
-                                self.logger.warning(f"No valid images found for {metadata['set_num']}")
-                                invalid_count += 1
+                    if metadata.get('is_custom') or 'custom-' in metadata.get('set_num', ''):
+                        # For custom images
+                        custom_dir = self.images_dir / 'custom' / metadata['set_num']
+                        custom_images = list(custom_dir.glob(f"{metadata['set_num']}-*.png")) + \
+                                    list(custom_dir.glob(f"{metadata['set_num']}-*.jpg"))
+                        
+                        if custom_images:
+                            metadata['images'] = [str(img) for img in sorted(custom_images)]
+                            self.logger.debug(f"Found {len(custom_images)} custom images for {metadata['set_num']}")
+                            metadata_list.append(metadata)
+                            valid_count += 1
+                        else:
+                            self.logger.warning(f"No images found for custom minifig {metadata['set_num']}")
+                            invalid_count += 1
                     else:
-                        # For standard images in train directory
+                        # For standard images
                         image_path = self.images_dir / f"{metadata['set_num']}.png"
                         if not image_path.exists():
                             image_path = self.images_dir / f"{metadata['set_num']}.jpg"
                         
                         if image_path.exists():
                             metadata['images'] = [str(image_path)]
+                            self.logger.debug(f"Found standard image: {image_path}")
                             metadata_list.append(metadata)
                             valid_count += 1
                         else:
                             self.logger.warning(f"Missing image for {metadata['set_num']}")
                             invalid_count += 1
                 else:
-                    missing_fields = [field for field in required_fields if field not in metadata]
                     self.logger.warning(f"Missing required fields {missing_fields} in {meta_file.name}")
                     invalid_count += 1
                     
@@ -135,12 +119,18 @@ class MinifigureDataPreprocessor:
                 self.logger.error(f"Error processing {meta_file.name}: {e}")
                 invalid_count += 1
         
-        self.logger.info(f"""
+        # Final validation
+        if not metadata_list:
+            self.logger.error("No valid metadata entries found!")
+            self.logger.error("Directory structure:")
+            self.print_directory_structure()
+        else:
+            self.logger.info(f"""
     Metadata loading completed:
     - Valid entries: {valid_count}
     - Invalid entries: {invalid_count}
-    - Custom images: {sum(1 for m in metadata_list if m.get('is_custom', True))}
-    - Standard images: {sum(1 for m in metadata_list if not m.get('is_custom', False))}
+    - Custom minifigs: {sum(1 for m in metadata_list if m.get('is_custom', False))}
+    - Official minifigs: {sum(1 for m in metadata_list if not m.get('is_custom', False))}
     """)
         
         return metadata_list
