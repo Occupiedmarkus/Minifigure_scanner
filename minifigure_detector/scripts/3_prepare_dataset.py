@@ -1,238 +1,276 @@
-# scripts/3_prepare_dataset.py
 import os
+import yaml
+import logging
+import numpy as np
 from pathlib import Path
 from dotenv import load_dotenv
-import logging
-import shutil
-import yaml
-import random
-from sklearn.model_selection import train_test_split
-from tqdm import tqdm
-import cv2
-import numpy as np
+from datetime import datetime
 
-class DatasetPreparator:
+import tensorflow as tf
+from tensorflow.keras import layers, models, optimizers
+from tensorflow.keras.callbacks import ModelCheckpoint, EarlyStopping, TensorBoard, ReduceLROnPlateau
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import classification_report
+
+class MinifigureModelTrainer:
     def __init__(self):
         # Load environment variables
         load_dotenv()
         
-        # Setup paths
-        self.base_dir = Path(os.getenv('DATASET_PATH', 'dataset'))
-        self.splits = {
-            'train': self.base_dir / 'train',
-            'val': self.base_dir / 'val',
-            'test': self.base_dir / 'test'
-        }
-        
-        # Source directories
-        self.images_dir = self.base_dir / 'images'
-        self.labels_dir = self.base_dir / 'labels'
-        self.metadata_dir = self.base_dir / 'metadata'
-        
-        self.setup_logging()
-        self.setup_directories()
-
-    def setup_logging(self):
-        """Setup logging configuration"""
-        log_dir = Path('logs')
-        log_dir.mkdir(exist_ok=True)
-        
+        # Setup logging
         logging.basicConfig(
             level=logging.INFO,
-            format='%(asctime)s - %(levelname)s - %(message)s',
-            handlers=[
-                logging.StreamHandler(),
-                logging.FileHandler(log_dir / 'dataset_preparation.log')
-            ]
+            format='%(asctime)s - %(levelname)s - %(message)s'
         )
         self.logger = logging.getLogger(__name__)
-
-    def setup_directories(self):
-        """Create necessary directories for dataset splits"""
-        for split in self.splits.values():
-            (split / 'images').mkdir(parents=True, exist_ok=True)
-            (split / 'labels').mkdir(parents=True, exist_ok=True)
-
-    def validate_data(self):
-        """Validate that each image has a corresponding label file"""
-        images = list(self.images_dir.glob('*.jpg'))
-        valid_pairs = []
         
-        self.logger.info("Validating image-label pairs...")
-        for img_path in tqdm(images, desc="Validating data"):
-            label_path = self.labels_dir / f"{img_path.stem}.txt"
-            if label_path.exists():
-                # Validate label format
-                try:
-                    with open(label_path, 'r') as f:
-                        label_content = f.read().strip()
-                        # Check YOLO format: class x_center y_center width height
-                        values = label_content.split()
-                        if len(values) == 5 and all(self.is_float(v) for v in values[1:]):
-                            valid_pairs.append((img_path, label_path))
-                        else:
-                            self.logger.warning(f"Invalid label format in {label_path}")
-                except Exception as e:
-                    self.logger.error(f"Error reading {label_path}: {e}")
-            else:
-                self.logger.warning(f"No label found for {img_path}")
+        # Setup paths
+        self.base_dir = Path(os.getenv('DATASET_PATH', 'dataset'))
+        self.labels_dir = self.base_dir / 'labels'
+        self.models_dir = self.base_dir / 'models'
+        self.logs_dir = self.base_dir / 'logs'
         
-        return valid_pairs
-
-    @staticmethod
-    def is_float(value):
-        """Check if string can be converted to float"""
+        # Create necessary directories
+        self.models_dir.mkdir(parents=True, exist_ok=True)
+        self.logs_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Training parameters
+        self.batch_size = 32
+        self.epochs = 100
+        self.learning_rate = 0.001
+        self.validation_split = 0.2
+        
+        # Load data
+        self.load_data()
+        
+    def load_data(self):
+        """Load preprocessed data"""
         try:
-            float(value)
-            return True
-        except ValueError:
-            return False
-
-    def augment_image(self, image_path, label_path):
-        """Apply basic augmentations to image and adjust labels"""
-        augmented_pairs = []
-        img = cv2.imread(str(image_path))
-        
-        if img is None:
-            return augmented_pairs
-
-        # Read original label
-        with open(label_path, 'r') as f:
-            label_content = f.read().strip()
-            class_id, x_center, y_center, width, height = map(float, label_content.split())
-
-        # Basic augmentations
-        augmentations = [
-            ('flip', cv2.flip(img, 1)),  # Horizontal flip
-            ('bright', cv2.convertScaleAbs(img, alpha=1.2, beta=10)),  # Brightness
-            ('contrast', cv2.convertScaleAbs(img, alpha=1.3, beta=0))  # Contrast
-        ]
-
-        for aug_name, aug_img in augmentations:
-            # Create augmented image filename
-            aug_img_path = image_path.parent / f"{image_path.stem}_{aug_name}.jpg"
-            aug_label_path = label_path.parent / f"{image_path.stem}_{aug_name}.txt"
-
-            # Save augmented image
-            cv2.imwrite(str(aug_img_path), aug_img)
-
-            # Adjust and save label (only horizontal flip needs adjustment)
-            with open(aug_label_path, 'w') as f:
-                if aug_name == 'flip':
-                    # Adjust x coordinate for horizontal flip
-                    new_x = 1 - x_center
-                    f.write(f"{int(class_id)} {new_x} {y_center} {width} {height}\n")
-                else:
-                    f.write(label_content + '\n')
-
-            augmented_pairs.append((aug_img_path, aug_label_path))
-
-        return augmented_pairs
-
-    def split_dataset(self, valid_pairs, train_size=0.7, val_size=0.2):
-        """Split dataset into train/val/test sets"""
-        # Optionally augment training data
-        augment = input("Would you like to augment the training data? (y/n): ").lower() == 'y'
-        
-        # Split datasets
-        train_val_pairs, test_pairs = train_test_split(
-            valid_pairs, 
-            train_size=train_size + val_size,
-            random_state=42
-        )
-        
-        train_pairs, val_pairs = train_test_split(
-            train_val_pairs,
-            train_size=train_size/(train_size + val_size),
-            random_state=42
-        )
-
-        # Augment training data if requested
-        if augment:
-            self.logger.info("Augmenting training data...")
-            augmented_pairs = []
-            for img_path, label_path in tqdm(train_pairs, desc="Augmenting"):
-                aug_pairs = self.augment_image(img_path, label_path)
-                augmented_pairs.extend(aug_pairs)
-            train_pairs.extend(augmented_pairs)
-            self.logger.info(f"Added {len(augmented_pairs)} augmented images")
-
-        # Copy files to respective directories
-        splits_data = {
-            'train': train_pairs,
-            'val': val_pairs,
-            'test': test_pairs
-        }
-
-        for split_name, pairs in splits_data.items():
-            self.logger.info(f"Preparing {split_name} split...")
-            split_dir = self.splits[split_name]
+            # Load numpy arrays
+            self.images = np.load(self.labels_dir / 'images.npy')
+            self.years = np.load(self.labels_dir / 'years.npy')
+            self.themes = np.load(self.labels_dir / 'themes.npy')
             
-            for img_path, label_path in tqdm(pairs, desc=f"Copying {split_name}"):
-                # Copy image
-                shutil.copy2(img_path, split_dir / 'images' / img_path.name)
-                # Copy label
-                shutil.copy2(label_path, split_dir / 'labels' / label_path.name)
-
-        # Create data.yaml
-        self.create_data_yaml(len(splits_data['train']), 
-                            len(splits_data['val']), 
-                            len(splits_data['test']))
-
-    def create_data_yaml(self, train_count, val_count, test_count):
-        """Create data.yaml file for YOLOv8"""
-        yaml_content = {
-            'path': str(self.base_dir.absolute()),
-            'train': str(Path('train/images')),
-            'val': str(Path('val/images')),
-            'test': str(Path('test/images')),
-            'nc': 1,
-            'names': ['minifigure'],
-            'splits': {
-                'train': train_count,
-                'val': val_count,
-                'test': test_count
-            }
-        }
-        
-        yaml_path = self.base_dir / "data.yaml"
-        with open(yaml_path, 'w') as f:
-            yaml.dump(yaml_content, f, default_flow_style=False)
-        
-        self.logger.info(f"Created data.yaml at {yaml_path}")
-
-    def prepare_dataset(self):
-        """Main method to prepare the dataset"""
-        try:
-            # Validate data
-            self.logger.info("Starting dataset preparation...")
-            valid_pairs = self.validate_data()
+            # Load mappings
+            with open(self.labels_dir / 'encoders_mapping.yaml', 'r') as f:
+                self.encoders_mapping = yaml.safe_load(f)
             
-            if not valid_pairs:
-                self.logger.error("No valid image-label pairs found!")
-                return
+            self.num_years = len(self.encoders_mapping['year_mapping'])
+            self.num_themes = len(self.encoders_mapping['theme_mapping'])
             
-            self.logger.info(f"Found {len(valid_pairs)} valid image-label pairs")
-            
-            # Get split ratios from user or use defaults
-            train_size = float(input("Enter train split ratio (default 0.7): ") or 0.7)
-            val_size = float(input("Enter validation split ratio (default 0.2): ") or 0.2)
-            test_size = 1 - train_size - val_size
-            
-            self.logger.info(f"Split ratios - Train: {train_size}, Val: {val_size}, Test: {test_size}")
-            
-            # Split and prepare dataset
-            self.split_dataset(valid_pairs, train_size, val_size)
-            
-            self.logger.info("Dataset preparation completed successfully!")
+            self.logger.info(f"""
+Data loaded successfully:
+- Images: {self.images.shape}
+- Years: {self.years.shape} (unique: {self.num_years})
+- Themes: {self.themes.shape} (unique: {self.num_themes})
+""")
             
         except Exception as e:
-            self.logger.error(f"Error preparing dataset: {e}")
+            self.logger.error(f"Error loading data: {e}")
             raise
 
+    def create_model(self):
+        """Create and compile the model"""
+        # Base model - EfficientNetB0
+        base_model = tf.keras.applications.EfficientNetB0(
+            include_top=False,
+            weights='imagenet',
+            input_shape=self.images[0].shape
+        )
+        
+        # Freeze the base model
+        base_model.trainable = False
+        
+        # Create model
+        inputs = layers.Input(shape=self.images[0].shape)
+        x = tf.keras.applications.efficientnet.preprocess_input(inputs)
+        
+        # Base model
+        x = base_model(x, training=False)
+        x = layers.GlobalAveragePooling2D()(x)
+        x = layers.Dropout(0.2)(x)
+        
+        # Common dense layers
+        x = layers.Dense(512, activation='relu')(x)
+        x = layers.BatchNormalization()(x)
+        x = layers.Dropout(0.3)(x)
+        
+        # Two output heads
+        year_output = layers.Dense(self.num_years, activation='softmax', name='year_output')(x)
+        theme_output = layers.Dense(self.num_themes, activation='softmax', name='theme_output')(x)
+        
+        # Create model
+        model = models.Model(
+            inputs=inputs,
+            outputs=[year_output, theme_output]
+        )
+        
+        # Compile model
+        model.compile(
+            optimizer=optimizers.Adam(learning_rate=self.learning_rate),
+            loss={
+                'year_output': 'sparse_categorical_crossentropy',
+                'theme_output': 'sparse_categorical_crossentropy'
+            },
+            metrics={
+                'year_output': ['accuracy'],
+                'theme_output': ['accuracy']
+            }
+        )
+        
+        return model
+
+    def create_callbacks(self, model_name):
+        """Create training callbacks"""
+        callbacks = [
+            # Model checkpoint
+            ModelCheckpoint(
+                filepath=self.models_dir / f'{model_name}_best.h5',
+                monitor='val_loss',
+                save_best_only=True,
+                mode='min',
+                verbose=1
+            ),
+            # Early stopping
+            EarlyStopping(
+                monitor='val_loss',
+                patience=10,
+                restore_best_weights=True,
+                verbose=1
+            ),
+            # Learning rate reduction
+            ReduceLROnPlateau(
+                monitor='val_loss',
+                factor=0.2,
+                patience=5,
+                min_lr=1e-6,
+                verbose=1
+            ),
+            # TensorBoard logging
+            TensorBoard(
+                log_dir=self.logs_dir / datetime.now().strftime("%Y%m%d-%H%M%S"),
+                histogram_freq=1
+            )
+        ]
+        return callbacks
+
+    def train_model(self):
+        """Train the model"""
+        try:
+            # Split data
+            X_train, X_val, y_year_train, y_year_val, y_theme_train, y_theme_val = train_test_split(
+                self.images,
+                self.years,
+                self.themes,
+                test_size=self.validation_split,
+                random_state=42
+            )
+            
+            # Create model
+            model = self.create_model()
+            model_name = f"minifig_classifier_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+            
+            # Create callbacks
+            callbacks = self.create_callbacks(model_name)
+            
+            # Train model
+            self.logger.info("Starting model training...")
+            history = model.fit(
+                X_train,
+                {'year_output': y_year_train, 'theme_output': y_theme_train},
+                batch_size=self.batch_size,
+                epochs=self.epochs,
+                validation_data=(
+                    X_val,
+                    {'year_output': y_year_val, 'theme_output': y_theme_val}
+                ),
+                callbacks=callbacks,
+                verbose=1
+            )
+            
+            # Evaluate model
+            self.logger.info("Evaluating model...")
+            evaluation = model.evaluate(
+                X_val,
+                {'year_output': y_year_val, 'theme_output': y_theme_val},
+                verbose=1
+            )
+            
+            # Generate predictions
+            y_pred_year, y_pred_theme = model.predict(X_val)
+            y_pred_year = np.argmax(y_pred_year, axis=1)
+            y_pred_theme = np.argmax(y_pred_theme, axis=1)
+            
+            # Generate classification reports
+            year_report = classification_report(
+                y_year_val,
+                y_pred_year,
+                target_names=list(self.encoders_mapping['year_mapping'].keys())
+            )
+            theme_report = classification_report(
+                y_theme_val,
+                y_pred_theme,
+                target_names=list(self.encoders_mapping['theme_mapping'].keys())
+            )
+            
+            # Save reports
+            with open(self.models_dir / f'{model_name}_evaluation.txt', 'w') as f:
+                f.write("Year Classification Report:\n")
+                f.write(year_report)
+                f.write("\nTheme Classification Report:\n")
+                f.write(theme_report)
+            
+            # Save model architecture
+            with open(self.models_dir / f'{model_name}_architecture.yaml', 'w') as f:
+                f.write(model.to_yaml())
+            
+            # Save training history
+            np.save(self.models_dir / f'{model_name}_history.npy', history.history)
+            
+            self.logger.info(f"""
+Training completed successfully:
+- Model saved as: {model_name}
+- Final validation loss: {evaluation[0]:.4f}
+- Year accuracy: {evaluation[3]:.4f}
+- Theme accuracy: {evaluation[4]:.4f}
+""")
+            
+            return model, history
+            
+        except Exception as e:
+            self.logger.error(f"Error during training: {e}")
+            raise
+
+    def fine_tune_model(self, model, learning_rate=1e-5):
+        """Fine-tune the model"""
+        # Unfreeze the base model
+        model.layers[2].trainable = True
+        
+        # Recompile model with lower learning rate
+        model.compile(
+            optimizer=optimizers.Adam(learning_rate=learning_rate),
+            loss={
+                'year_output': 'sparse_categorical_crossentropy',
+                'theme_output': 'sparse_categorical_crossentropy'
+            },
+            metrics={
+                'year_output': ['accuracy'],
+                'theme_output': ['accuracy']
+            }
+        )
+        
+        return model
+
 def main():
-    preparator = DatasetPreparator()
-    preparator.prepare_dataset()
+    trainer = MinifigureModelTrainer()
+    
+    # Train initial model
+    model, history = trainer.train_model()
+    
+    # Ask for fine-tuning
+    if input("\nWould you like to fine-tune the model? (y/n): ").lower() == 'y':
+        model = trainer.fine_tune_model(model)
+        trainer.train_model()  # Train again with fine-tuned model
 
 if __name__ == "__main__":
     main()

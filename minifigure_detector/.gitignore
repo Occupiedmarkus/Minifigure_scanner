@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.env
+
+# Docker
+.docker/
+
+# Dataset
+dataset/images/*
+dataset/processed/*
+!dataset/images/.gitkeep
+!dataset/processed/.gitkeep
+
+# Models
+dataset/models/*
+!dataset/models/.gitkeep
+
+# Logs
+*.log
+
+# IDE
+.vscode/
+.idea/

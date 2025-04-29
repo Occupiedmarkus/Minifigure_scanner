@@ -1,340 +1,254 @@
-# scripts/5_detect_and_search.py
-import cv2
-import torch
-from ultralytics import YOLO
-from pathlib import Path
 import os
-from dotenv import load_dotenv
-import logging
 import yaml
-import json
+import logging
 import numpy as np
+from pathlib import Path
 from PIL import Image
-import sqlite3
+import tensorflow as tf
+from dotenv import load_dotenv
+from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+import uvicorn
+from typing import List, Dict
+import io
+import time
 from datetime import datetime
-from tqdm import tqdm
+import redis
+import jwt
+from pydantic import BaseModel
 
-class MinifigureDetector:
+class PredictionRequest(BaseModel):
+    image: str  # Base64 encoded image
+    confidence_threshold: float = 0.5
+
+class MinifigureModelServer:
     def __init__(self):
         # Load environment variables
         load_dotenv()
         
-        # Setup paths
-        self.base_dir = Path(os.getenv('DATASET_PATH', 'dataset'))
-        self.model_path = Path(os.getenv('MODEL_PATH', 'models/weights/best.pt'))
-        self.db_path = Path(os.getenv('DATABASE_PATH', 'database/minifigures.db'))
-        
-        # Ensure directories exist
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        
-        # Setup components
-        self.setup_logging()
-        self.setup_database()
-        self.load_model()
-        self.load_metadata()
-
-    def setup_logging(self):
-        """Setup logging configuration"""
-        log_dir = Path('logs')
-        log_dir.mkdir(exist_ok=True)
-        
+        # Setup logging
         logging.basicConfig(
             level=logging.INFO,
-            format='%(asctime)s - %(levelname)s - %(message)s',
-            handlers=[
-                logging.StreamHandler(),
-                logging.FileHandler(log_dir / 'detection.log')
-            ]
+            format='%(asctime)s - %(levelname)s - %(message)s'
         )
         self.logger = logging.getLogger(__name__)
-
-    def setup_database(self):
-        """Setup SQLite database for detection results"""
-        self.conn = sqlite3.connect(self.db_path)
-        self.cursor = self.conn.cursor()
         
-        # Create tables if they don't exist
-        self.cursor.execute('''
-            CREATE TABLE IF NOT EXISTS detections (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                image_path TEXT,
-                detection_time TIMESTAMP,
-                confidence REAL,
-                bbox_x REAL,
-                bbox_y REAL,
-                bbox_width REAL,
-                bbox_height REAL,
-                metadata_id TEXT
-            )
-        ''')
+        # Setup paths
+        self.base_dir = Path(os.getenv('DATASET_PATH', 'dataset'))
+        self.models_dir = self.base_dir / 'models'
+        self.labels_dir = self.base_dir / 'labels'
         
-        self.cursor.execute('''
-            CREATE TABLE IF NOT EXISTS metadata (
-                id TEXT PRIMARY KEY,
-                name TEXT,
-                year INTEGER,
-                num_parts INTEGER,
-                url TEXT
-            )
-        ''')
+        # Initialize Redis for caching
+        self.redis_client = redis.Redis(
+            host=os.getenv('REDIS_HOST', 'localhost'),
+            port=int(os.getenv('REDIS_PORT', 6379)),
+            db=0,
+            decode_responses=True
+        )
         
-        self.conn.commit()
+        # Load model and encoders
+        self.load_model()
+        self.load_encoders()
+        
+        # Initialize API
+        self.app = self.create_api()
 
     def load_model(self):
-        """Load the trained YOLO model"""
+        """Load the latest trained model"""
         try:
-            self.model = YOLO(self.model_path)
-            self.logger.info(f"Model loaded from {self.model_path}")
+            # Load model with TF-Serving optimization
+            model_files = list(self.models_dir.glob('*_best.h5'))
+            if not model_files:
+                raise FileNotFoundError("No trained models found")
+            
+            latest_model = max(model_files, key=lambda x: x.stat().st_mtime)
+            self.logger.info(f"Loading model: {latest_model.name}")
+            
+            # Load model with optimization
+            self.model = tf.keras.models.load_model(latest_model)
+            
+            # Convert model for TF-Serving
+            self.model_version = int(time.time())
+            tf.saved_model.save(
+                self.model,
+                str(self.models_dir / f'serving/{self.model_version}')
+            )
+            
         except Exception as e:
             self.logger.error(f"Error loading model: {e}")
             raise
 
-    def load_metadata(self):
-        """Load minifigure metadata"""
-        self.metadata = {}
-        metadata_dir = self.base_dir / 'metadata'
-        
-        if metadata_dir.exists():
-            for meta_file in metadata_dir.glob('*.yaml'):
-                with open(meta_file, 'r') as f:
-                    data = yaml.safe_load(f)
-                    self.metadata[meta_file.stem] = data
-                    
-                    # Update database
-                    self.cursor.execute('''
-                        INSERT OR REPLACE INTO metadata (id, name, year, num_parts, url)
-                        VALUES (?, ?, ?, ?, ?)
-                    ''', (
-                        data['set_num'],
-                        data['name'],
-                        data['year'],
-                        data['num_parts'],
-                        data['url']
-                    ))
-            
-            self.conn.commit()
-            self.logger.info(f"Loaded metadata for {len(self.metadata)} minifigures")
-
-    def detect_image(self, image_path, conf_threshold=0.25):
-        """Detect minifigures in an image"""
+    def load_encoders(self):
+        """Load label encoders mapping"""
         try:
-            # Run detection
-            results = self.model(image_path, conf=conf_threshold)[0]
+            with open(self.labels_dir / 'encoders_mapping.yaml', 'r') as f:
+                self.encoders_mapping = yaml.safe_load(f)
             
-            # Process results
-            detections = []
-            for box in results.boxes:
-                confidence = float(box.conf)
-                bbox = box.xyxy[0].tolist()  # x1, y1, x2, y2
-                
-                # Convert to center format
-                x_center = (bbox[0] + bbox[2]) / 2
-                y_center = (bbox[1] + bbox[3]) / 2
-                width = bbox[2] - bbox[0]
-                height = bbox[3] - bbox[1]
-                
-                detection = {
-                    'confidence': confidence,
-                    'bbox': (x_center, y_center, width, height)
-                }
-                detections.append(detection)
-                
-                # Store in database
-                self.cursor.execute('''
-                    INSERT INTO detections 
-                    (image_path, detection_time, confidence, bbox_x, bbox_y, bbox_width, bbox_height)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                ''', (
-                    str(image_path),
-                    datetime.now(),
-                    confidence,
-                    x_center,
-                    y_center,
-                    width,
-                    height
-                ))
-            
-            self.conn.commit()
-            return detections
+            self.year_mapping = {v: k for k, v in self.encoders_mapping['year_mapping'].items()}
+            self.theme_mapping = {v: k for k, v in self.encoders_mapping['theme_mapping'].items()}
             
         except Exception as e:
-            self.logger.error(f"Error during detection: {e}")
-            return []
+            self.logger.error(f"Error loading encoders: {e}")
+            raise
 
-    def draw_detections(self, image_path, detections, save_path=None):
-        """Draw detection boxes on image"""
+    def preprocess_image(self, image_data: bytes) -> np.ndarray:
+        """Preprocess image for model input"""
         try:
-            # Read image
-            img = cv2.imread(str(image_path))
-            height, width = img.shape[:2]
+            # Open image from bytes
+            img = Image.open(io.BytesIO(image_data))
             
-            # Draw each detection
-            for det in detections:
-                # Convert center format to corners
-                x_center, y_center, w, h = det['bbox']
-                x1 = int((x_center - w/2) * width)
-                y1 = int((y_center - h/2) * height)
-                x2 = int((x_center + w/2) * width)
-                y2 = int((y_center + h/2) * height)
-                
-                # Draw rectangle
-                cv2.rectangle(img, (x1, y1), (x2, y2), (0, 255, 0), 2)
-                
-                # Draw confidence
-                conf_text = f"{det['confidence']:.2f}"
-                cv2.putText(img, conf_text, (x1, y1-10),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+            # Convert to RGB if necessary
+            if img.mode != 'RGB':
+                img = img.convert('RGB')
             
-            # Save or display
-            if save_path:
-                cv2.imwrite(str(save_path), img)
-            else:
-                cv2.imshow('Detections', img)
-                cv2.waitKey(0)
-                cv2.destroyAllWindows()
-                
-        except Exception as e:
-            self.logger.error(f"Error drawing detections: {e}")
-
-    def search_similar(self, image_path, top_k=5):
-        """Search for similar minifigures in the dataset"""
-        try:
-            # Get features from the query image
-            results = self.model(image_path, conf=0.25)[0]
-            if len(results.boxes) == 0:
-                return []
+            # Resize to match model input
+            img = img.resize((224, 224), Image.Resampling.LANCZOS)
             
-            # Get the highest confidence detection
-            query_features = results.boxes[0].xywh[0].tolist()  # center format
+            # Convert to numpy array and normalize
+            img_array = np.array(img) / 255.0
             
-            # Search database
-            self.cursor.execute('''
-                SELECT d.image_path, d.confidence, m.name, m.year, m.url,
-                       ABS(d.bbox_width - ?) + ABS(d.bbox_height - ?) as diff
-                FROM detections d
-                LEFT JOIN metadata m ON d.metadata_id = m.id
-                WHERE d.confidence > 0.5
-                ORDER BY diff ASC
-                LIMIT ?
-            ''', (query_features[2], query_features[3], top_k))
+            # Add batch dimension
+            img_array = np.expand_dims(img_array, axis=0)
             
-            similar = self.cursor.fetchall()
-            
-            # Format results
-            results = []
-            for row in similar:
-                results.append({
-                    'image_path': row[0],
-                    'confidence': row[1],
-                    'name': row[2],
-                    'year': row[3],
-                    'url': row[4],
-                    'similarity_score': 1.0 / (1.0 + row[5])  # Convert difference to similarity
-                })
-            
-            return results
+            return img_array
             
         except Exception as e:
-            self.logger.error(f"Error during similarity search: {e}")
-            return []
+            self.logger.error(f"Error preprocessing image: {e}")
+            raise
 
-    def batch_process(self, input_dir, output_dir=None):
-        """Process multiple images in a directory"""
-        input_path = Path(input_dir)
-        if output_dir:
-            output_path = Path(output_dir)
-            output_path.mkdir(parents=True, exist_ok=True)
-        
-        image_files = list(input_path.glob('*.jpg')) + list(input_path.glob('*.png'))
-        
-        results = {}
-        for img_path in tqdm(image_files, desc="Processing images"):
-            detections = self.detect_image(img_path)
-            results[str(img_path)] = detections
+    def predict(self, image_data: bytes, confidence_threshold: float = 0.5) -> Dict:
+        """Make predictions for a single image"""
+        try:
+            # Generate cache key
+            cache_key = f"pred_{hash(image_data)}_{confidence_threshold}"
             
-            if output_dir:
-                output_file = output_path / f"{img_path.stem}_detected{img_path.suffix}"
-                self.draw_detections(img_path, detections, save_path=output_file)
-        
-        return results
+            # Check cache
+            cached_result = self.redis_client.get(cache_key)
+            if cached_result:
+                return yaml.safe_load(cached_result)
+            
+            # Preprocess image
+            processed_image = self.preprocess_image(image_data)
+            
+            # Get predictions
+            year_pred, theme_pred = self.model.predict(processed_image)
+            
+            # Filter predictions by confidence threshold
+            year_indices = np.where(year_pred[0] >= confidence_threshold)[0]
+            theme_indices = np.where(theme_pred[0] >= confidence_threshold)[0]
+            
+            # Sort by confidence
+            year_indices = year_indices[np.argsort(year_pred[0][year_indices])[::-1]]
+            theme_indices = theme_indices[np.argsort(theme_pred[0][theme_indices])[::-1]]
+            
+            # Format predictions
+            predictions = {
+                'years': [
+                    {
+                        'year': str(self.year_mapping[idx]),
+                        'confidence': float(year_pred[0][idx])
+                    }
+                    for idx in year_indices
+                ],
+                'themes': [
+                    {
+                        'theme': str(self.theme_mapping[idx]),
+                        'confidence': float(theme_pred[0][idx])
+                    }
+                    for idx in theme_indices
+                ],
+                'timestamp': datetime.now().isoformat()
+            }
+            
+            # Cache result
+            self.redis_client.setex(
+                cache_key,
+                300,  # Cache for 5 minutes
+                yaml.dump(predictions)
+            )
+            
+            return predictions
+            
+        except Exception as e:
+            self.logger.error(f"Error making prediction: {e}")
+            raise
 
-    def interactive_mode(self):
-        """Interactive detection and search mode"""
-        while True:
-            print("\nMinifigure Detection and Search")
-            print("1. Detect in single image")
-            print("2. Batch process directory")
-            print("3. Search similar minifigures")
-            print("4. View detection history")
-            print("5. Exit")
+    def create_api(self) -> FastAPI:
+        """Create FastAPI application"""
+        app = FastAPI(
+            title="Minifigure Classifier API",
+            description="API for classifying LEGO minifigures",
+            version="1.0.0"
+        )
+        
+        # Add CORS middleware
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=["*"],
+            allow_credentials=True,
+            allow_methods=["*"],
+            allow_headers=["*"],
+        )
+        
+        # Authentication middleware
+        @app.middleware("http")
+        async def authenticate(request, call_next):
+            if request.url.path in ["/docs", "/redoc", "/openapi.json"]:
+                return await call_next(request)
             
-            choice = input("\nEnter your choice (1-5): ")
+            auth_header = request.headers.get("Authorization")
+            if not auth_header:
+                raise HTTPException(status_code=401, detail="Missing authentication token")
             
-            if choice == '1':
-                image_path = input("Enter image path: ")
-                if not Path(image_path).exists():
-                    print("Image not found!")
-                    continue
-                    
-                detections = self.detect_image(image_path)
-                self.draw_detections(image_path, detections)
-                
-            elif choice == '2':
-                input_dir = input("Enter input directory: ")
-                output_dir = input("Enter output directory (optional): ")
-                
-                if not Path(input_dir).exists():
-                    print("Directory not found!")
-                    continue
-                    
-                results = self.batch_process(input_dir, output_dir)
-                print(f"Processed {len(results)} images")
-                
-            elif choice == '3':
-                image_path = input("Enter query image path: ")
-                if not Path(image_path).exists():
-                    print("Image not found!")
-                    continue
-                    
-                similar = self.search_similar(image_path)
-                
-                print("\nSimilar minifigures:")
-                for idx, result in enumerate(similar, 1):
-                    print(f"\n{idx}. {result['name']} ({result['year']})")
-                    print(f"   Confidence: {result['confidence']:.2f}")
-                    print(f"   Similarity: {result['similarity_score']:.2f}")
-                    print(f"   URL: {result['url']}")
-                
-            elif choice == '4':
-                self.cursor.execute('''
-                    SELECT image_path, detection_time, confidence
-                    FROM detections
-                    ORDER BY detection_time DESC
-                    LIMIT 10
-                ''')
-                
-                print("\nRecent detections:")
-                for row in self.cursor.fetchall():
-                    print(f"\nImage: {row[0]}")
-                    print(f"Time: {row[1]}")
-                    print(f"Confidence: {row[2]:.2f}")
-                
-            elif choice == '5':
-                break
-                
-            else:
-                print("Invalid choice!")
+            try:
+                token = auth_header.split(" ")[1]
+                jwt.decode(token, os.getenv("JWT_SECRET"), algorithms=["HS256"])
+            except Exception:
+                raise HTTPException(status_code=401, detail="Invalid authentication token")
+            
+            return await call_next(request)
+        
+        @app.post("/predict")
+        async def predict_endpoint(file: UploadFile = File(...)):
+            try:
+                contents = await file.read()
+                predictions = self.predict(contents)
+                return JSONResponse(content=predictions)
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=str(e))
+        
+        @app.post("/predict/batch")
+        async def predict_batch_endpoint(files: List[UploadFile] = File(...)):
+            try:
+                results = []
+                for file in files:
+                    contents = await file.read()
+                    predictions = self.predict(contents)
+                    results.append({
+                        'filename': file.filename,
+                        'predictions': predictions
+                    })
+                return JSONResponse(content={'results': results})
+            except Exception as e:
+                raise HTTPException(status_code=500, detail=str(e))
+        
+        @app.get("/health")
+        async def health_check():
+            return {"status": "healthy", "model_version": self.model_version}
+        
+        return app
 
-    def cleanup(self):
-        """Cleanup resources"""
-        self.conn.close()
+    def run_server(self, host: str = "0.0.0.0", port: int = 8000):
+        """Run the API server"""
+        uvicorn.run(self.app, host=host, port=port)
 
 def main():
-    detector = MinifigureDetector()
-    try:
-        detector.interactive_mode()
-    finally:
-        detector.cleanup()
+    # Create server instance
+    server = MinifigureModelServer()
+    
+    # Run server
+    server.run_server()
 
 if __name__ == "__main__":
     main()
