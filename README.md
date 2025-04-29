@@ -39,21 +39,20 @@ minifigure_detector/
 - **Docker** and Docker Compose
 - **NVIDIA GPU** _(optional, for faster training)_
 
-### Installation
-1️⃣ **Clone the repository**
-```bash
-git clone https://github.com/yourusername/minifigure_detector.git
-cd minifigure_detector
-```
-2️⃣ **Build Docker containers**
-```bash
-docker-compose build
-```
-
----
-
 ## 🔄 Usage Pipeline
 
+┌── 1. Collect ──┐
+│               ↓
+│           2. Preprocess
+│               ↓
+│           3. Train
+│               ↓
+│           4. Evaluate
+│               ↓
+└───────── 6. GUI Testing
+                ↓
+            5. API Deploy (when ready)
+            
 ### 1️⃣ Data Collection  
 Scrapes minifigure data and images:  
 ```bash
