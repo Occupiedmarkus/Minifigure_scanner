@@ -1,80 +1,8 @@
 theme_mapping:
-  ? !!python/object/apply:numpy._core.multiarray.scalar
-  - !!python/object/apply:numpy.dtype
-    args:
-    - U0
-    - false
-    - true
-    state: !!python/tuple
-    - 3
-    - <
-    - null
-    - null
-    - null
-    - 0
-    - 4
-    - 8
-  - !!binary ""
-  : !!python/object/apply:numpy._core.multiarray.scalar
-  - &id001 !!python/object/apply:numpy.dtype
-    args:
-    - i8
-    - false
-    - true
-    state: !!python/tuple
-    - 3
-    - <
-    - null
-    - null
-    - null
-    - -1
-    - -1
-    - 0
-  - !!binary |
-    AAAAAAAAAAA=
-  ? !!python/object/apply:numpy._core.multiarray.scalar
-  - !!python/object/apply:numpy.dtype
-    args:
-    - U6
-    - false
-    - true
-    state: !!python/tuple
-    - 3
-    - <
-    - null
-    - null
-    - null
-    - 24
-    - 4
-    - 8
-  - !!binary |
-    YwAAAHUAAABzAAAAdAAAAG8AAABtAAAA
-  : !!python/object/apply:numpy._core.multiarray.scalar
-  - *id001
-  - !!binary |
-    AQAAAAAAAAA=
+  ? ''
+  : 0
+  custom: 1
 year_mapping:
-  ? !!python/object/apply:numpy._core.multiarray.scalar
-  - *id001
-  - !!binary |
-    //////////8=
-  : !!python/object/apply:numpy._core.multiarray.scalar
-  - *id001
-  - !!binary |
-    AAAAAAAAAAA=
-  ? !!python/object/apply:numpy._core.multiarray.scalar
-  - *id001
-  - !!binary |
-    2AcAAAAAAAA=
-  : !!python/object/apply:numpy._core.multiarray.scalar
-  - *id001
-  - !!binary |
-    AQAAAAAAAAA=
-  ? !!python/object/apply:numpy._core.multiarray.scalar
-  - *id001
-  - !!binary |
-    5AcAAAAAAAA=
-  : !!python/object/apply:numpy._core.multiarray.scalar
-  - *id001
-  - !!binary |
-    AgAAAAAAAAA=
+  -1: 0
+  2008: 1
+  2020: 2

@@ -23,79 +23,71 @@ class MinifigureDataCollector:
         self.api_key = os.getenv('REBRICKABLE_API_KEY')
         self.base_url = 'https://rebrickable.com/api/v3/lego'
         self.base_dir = Path(os.getenv('DATASET_PATH', 'dataset'))
+        self.metadata_dir = self.base_dir / 'metadata'
+        self.images_dir = self.base_dir / 'images' / 'train'
+        
+        # Create necessary directories
+        self.metadata_dir.mkdir(parents=True, exist_ok=True)
+        self.images_dir.mkdir(parents=True, exist_ok=True)
         
         if not self.api_key:
             raise ValueError("API key not found. Please set REBRICKABLE_API_KEY in .env file")
 
-    def get_official_minifigs(self, page_size=50, min_year=1975, limit=None, skip_existing=True):
-        """
-        Get official LEGO minifigures with resume capability
-        
-        Args:
-            page_size (int): Number of results per page
-            min_year (int): Minimum year to filter results
-            limit (int): Maximum number of minifigures to collect
-            skip_existing (bool): Skip minifigures that are already in the dataset
-            
-        Returns:
-            list: Collection of minifigure data
-        """
+    def get_existing_minifigs(self):
+        """Get list of existing minifigure IDs from metadata directory"""
+        if not self.metadata_dir.exists():
+            return set()
+        return {p.stem for p in self.metadata_dir.glob('*.yaml')}
+
+    def get_official_minifigs(self, page_size=50, min_year=1975, limit=None):
+        """Get official LEGO minifigures with pagination"""
         headers = {'Authorization': f'key {self.api_key}'}
         minifigs = []
         page = 1
         
-        # Get list of already processed minifigs
-        existing_minifigs = set()
-        if skip_existing:
-            metadata_dir = self.base_dir / 'metadata'
-            if metadata_dir.exists():
-                existing_minifigs = {p.stem for p in metadata_dir.glob('*.yaml')}
-            self.logger.info(f"Found {len(existing_minifigs)} existing minifigures")
+        # Get existing minifigs to skip
+        existing_minifigs = self.get_existing_minifigs()
+        self.logger.info(f"Found {len(existing_minifigs)} existing minifigures")
         
         self.logger.info(f"Collecting official minifigures from year {min_year} onwards...")
         pbar = tqdm(desc="Collecting minifigures", unit="minifigs")
         
-        try:
-            while True:
+        while True:
+            try:
+                # Break if we've reached the limit
                 if limit and len(minifigs) >= limit:
-                    minifigs = minifigs[:limit]
                     break
                 
+                # Make API request for minifigs list
                 params = {
-                    'page_size': min(page_size, limit - len(minifigs) if limit else page_size),
+                    'page_size': page_size,
                     'page': page,
                     'min_year': min_year,
                     'ordering': 'year'
                 }
                 
-                # Get main minifigs list
-                try:
-                    response = requests.get(
-                        f"{self.base_url}/minifigs/",
-                        headers=headers,
-                        params=params,
-                        timeout=10
-                    )
-                    response.raise_for_status()
-                except requests.exceptions.RequestException as e:
-                    self.logger.error(f"API request failed: {e}")
-                    break
-                
+                response = requests.get(
+                    f"{self.base_url}/minifigs/",
+                    headers=headers,
+                    params=params,
+                    timeout=10
+                )
+                response.raise_for_status()
                 data = response.json()
+                
                 if not data.get('results'):
                     break
-                    
-                results = data['results']
                 
-                # Filter for official minifigures and skip existing ones
-                for fig in results:
-                    if not fig['set_num'].startswith('fig-'):
+                # Process results
+                for fig in data['results']:
+                    # Skip if we've reached the limit
+                    if limit and len(minifigs) >= limit:
+                        break
+                    
+                    # Skip if already exists
+                    if fig['set_num'] in existing_minifigs:
                         continue
-                        
-                    # Skip if already processed
-                    if skip_existing and fig['set_num'] in existing_minifigs:
-                        continue
-
+                    
                     try:
                         # First try getting year from the minifig's own details
                         minifig_response = requests.get(
@@ -113,6 +105,10 @@ class MinifigureDataCollector:
                                 self.logger.debug(f"Found year {fig['year']} for {fig['set_num']} from minifig details")
                             except (ValueError, TypeError):
                                 fig['year'] = None
+                        
+                        # Add theme and category
+                        fig['theme_id'] = minifig_data.get('theme_id', 'unknown')
+                        fig['category_id'] = minifig_data.get('category_id', 'unknown')
 
                         # If no year found, try getting it from the sets
                         if not fig.get('year'):
@@ -146,174 +142,309 @@ class MinifigureDataCollector:
                                 fig['year'] = min(years)  # First appearance year
                                 self.logger.debug(f"Found year {fig['year']} for {fig['set_num']} from sets")
                             else:
-                                fig['year'] = 'unknown'
-
-                        # Log success or failure of year detection
-                        if fig.get('year') and fig['year'] != 'unknown':
-                            self.logger.info(f"✓ {fig['set_num']} - {fig['name']}: Year {fig['year']} found")
-                        else:
-                            self.logger.warning(f"⚠ {fig['set_num']} - {fig['name']}: No year found")
+                                fig['year'] = -1
 
                         # Add delay to respect API rate limits
                         time.sleep(1)
 
+                        # Log success or failure of year detection
+                        if fig.get('year') and fig['year'] != -1:
+                            self.logger.info(f"✓ {fig['set_num']} - {fig['name']}: Year {fig['year']} found")
+                        else:
+                            self.logger.warning(f"⚠ {fig['set_num']} - {fig['name']}: No year found")
+
+                        minifigs.append(fig)
+                        pbar.update(1)
+                        
                     except requests.exceptions.RequestException as e:
                         self.logger.warning(f"Failed to get details for {fig['set_num']}: {e}")
-                        fig['year'] = 'unknown'
-                        
-                    minifigs.append(fig)
+                        continue
                     
-                    if limit and len(minifigs) >= limit:
-                        break
-                
-                pbar.update(len(minifigs) - pbar.n)
-                
-                if limit and len(minifigs) >= limit:
-                    minifigs = minifigs[:limit]
-                    break
-                
+                # Break if no more pages
                 if not data.get('next'):
                     break
                 
                 page += 1
-                time.sleep(1)  # Delay between pages
+                time.sleep(1)  # Rate limiting between pages
+                
+            except requests.exceptions.RequestException as e:
+                self.logger.error(f"API request failed: {e}")
+                break
+            except Exception as e:
+                self.logger.error(f"Error during minifigure collection: {e}")
+                break
         
-        except Exception as e:
-            self.logger.error(f"Unexpected error during minifigure collection: {e}")
-        finally:
-            pbar.close()
-        
-        if not minifigs and not existing_minifigs:
-            raise ValueError("No minifigures found! Please check your API key and internet connection.")
-            
-        self.logger.info(f"Found {len(minifigs)} new minifigures")
+        pbar.close()
         return minifigs
+
     def download_image(self, url, path):
         """Download image from URL"""
         try:
             response = requests.get(url)
-            if response.status_code == 200:
-                path.write_bytes(response.content)
-                return True
-            return False
+            response.raise_for_status()
+            path.write_bytes(response.content)
+            return True
         except Exception as e:
             self.logger.warning(f"Failed to download image {url}: {e}")
             return False
 
     def save_metadata(self, minifig):
         """Save minifigure metadata"""
-        metadata_file = self.base_dir / 'metadata' / f"{minifig['set_num']}.yaml"
-        metadata = {
-            'set_num': minifig.get('set_num', ''),
-            'name': minifig.get('name', ''),
-            'year': minifig.get('year', 'unknown'),
-            'num_parts': minifig.get('num_parts', 0),
-            'url': minifig.get('set_url', '')
-        }
-        
-        # Get additional details if available
         try:
-            headers = {'Authorization': f'key {self.api_key}'}
-            response = requests.get(
-                f"{self.base_url}/minifigs/{minifig['set_num']}/",
-                headers=headers
-            )
-            if response.status_code == 200:
-                details = response.json()
-                metadata.update({
-                    'theme': details.get('theme_id', ''),
-                    'category': details.get('category_id', ''),
-                    'designer': details.get('designer_id', '')
-                })
-        except Exception as e:
-            self.logger.warning(f"Could not fetch additional details for {minifig['set_num']}: {e}")
-        
-        with open(metadata_file, 'w') as f:
-            yaml.dump(metadata, f)
-
-    def collect_data(self, limit=None):
-        """Collect minifigure data with resume capability"""
-        try:
-            # Create directories if they don't exist
-            for dir_name in ['images/train', 'metadata', 'labels']:
-                dir_path = self.base_dir / dir_name
-                dir_path.mkdir(parents=True, exist_ok=True)
-            
-            # Load existing summary if it exists
-            summary_file = self.base_dir / 'dataset_summary.yaml'
-            existing_summary = {}
-            if summary_file.exists():
-                with open(summary_file, 'r') as f:
-                    existing_summary = yaml.safe_load(f)
-            
-            # Get new minifigures
-            minifigs = self.get_official_minifigs(limit=limit, skip_existing=True)
-            
-            if not minifigs and not existing_summary:
-                self.logger.info("No new minifigures to process")
-                return
-            
-            # Update summary
-            total_minifigs = len(minifigs) + existing_summary.get('total_minifigs', 0)
-            
-            # Get year range including existing data
-            start_year = existing_summary.get('year_range', '').split('-')[0] if existing_summary else "unknown"
-            end_year = existing_summary.get('year_range', '').split('-')[1] if existing_summary else "unknown"
-            
-            for fig in minifigs:
-                if fig.get('year'):
-                    if start_year == "unknown" or fig['year'] < int(start_year):
-                        start_year = fig['year']
-                    if end_year == "unknown" or fig['year'] > int(end_year):
-                        end_year = fig['year']
-            
-            # Create/update summary
-            summary = {
-                'total_minifigs': total_minifigs,
-                'year_range': f"{start_year}-{end_year}",
-                'collection_date': time.strftime('%Y-%m-%d'),
-                'downloaded_images': existing_summary.get('downloaded_images', 0)
+            metadata = {
+                'minifigure': {
+                    'set_num': minifig['set_num'],
+                    'name': minifig['name'],
+                    'year': minifig['year'],
+                    'theme': minifig.get('theme_id', 'unknown'),
+                    'category': 'official'
+                }
             }
             
-            # Download new images and save metadata
-            successful_downloads = 0
-            with tqdm(total=len(minifigs), desc="Downloading images") as pbar:
-                for minifig in minifigs:
-                    if minifig.get('set_img_url'):
-                        image_path = self.base_dir / 'images' / 'train'/ f"{minifig['set_num']}.jpg"
+            metadata_file = self.metadata_dir / f"{minifig['set_num']}.yaml"
+            with open(metadata_file, 'w') as f:
+                yaml.dump(metadata, f)
+            
+            return True
+        except Exception as e:
+            self.logger.warning(f"Failed to save metadata for {minifig['set_num']}: {e}")
+            return False
+
+    def update_incomplete_minifigs(self):
+        """Update existing minifigures with missing or -1 years"""
+        headers = {'Authorization': f'key {self.api_key}'}
+        updated_count = 0
+        
+        # Get all metadata files
+        metadata_files = list(self.metadata_dir.glob('*.yaml'))
+        
+        # Filter for minifigs with year == -1 or 'unknown'
+        incomplete_minifigs = []
+        for metadata_file in metadata_files:
+            with open(metadata_file, 'r') as f:
+                metadata = yaml.safe_load(f)
+                minifig = metadata.get('minifigure', {})
+                year = minifig.get('year')
+                if year == -1 or year == 'unknown':
+                    incomplete_minifigs.append((metadata_file, metadata))
+        
+        self.logger.info(f"Found {len(incomplete_minifigs)} minifigures with missing years (year = -1 or 'unknown')")
+        
+        with tqdm(incomplete_minifigs, desc="Updating minifigures") as pbar:
+            for metadata_file, metadata in pbar:
+                try:
+                    set_num = metadata['minifigure']['set_num']
+                    current_year = metadata['minifigure']['year']
+                    
+                    self.logger.info(f"Updating {set_num} (current year: {current_year})")
+                    
+                    # First try getting year from minifig details
+                    try:
+                        minifig_response = requests.get(
+                            f"{self.base_url}/minifigs/{set_num}/",
+                            headers=headers,
+                            timeout=10
+                        )
+                        minifig_response.raise_for_status()
+                        minifig_data = minifig_response.json()
                         
+                        if minifig_data.get('year'):
+                            try:
+                                new_year = int(minifig_data['year'])
+                                metadata['minifigure']['year'] = new_year
+                                self.logger.info(f"Found year {new_year} for {set_num} from minifig details")
+                                updated_count += 1
+                                
+                                # Save updated metadata
+                                with open(metadata_file, 'w') as f:
+                                    yaml.dump(metadata, f)
+                                continue
+                            except (ValueError, TypeError):
+                                pass
+                        
+                        # If still no year, try getting from sets
+                        time.sleep(1)  # Rate limiting
+                        sets_response = requests.get(
+                            f"{self.base_url}/minifigs/{set_num}/sets/",
+                            headers=headers,
+                            timeout=10
+                        )
+                        sets_response.raise_for_status()
+                        sets_data = sets_response.json()
+                        
+                        years = []
+                        if sets_data.get('results'):
+                            for set_info in sets_data['results']:
+                                time.sleep(1)  # Rate limiting
+                                set_detail_response = requests.get(
+                                    f"{self.base_url}/sets/{set_info['set_num']}/",
+                                    headers=headers,
+                                    timeout=10
+                                )
+                                if set_detail_response.status_code == 200:
+                                    set_detail = set_detail_response.json()
+                                    if set_detail.get('year'):
+                                        try:
+                                            years.append(int(set_detail['year']))
+                                        except (ValueError, TypeError):
+                                            continue
+                        
+                        if years:
+                            new_year = min(years)  # First appearance year
+                            metadata['minifigure']['year'] = new_year
+                            self.logger.info(f"Found year {new_year} for {set_num} from sets")
+                            updated_count += 1
+                        else:
+                            # If still no year found, ensure it's set to -1
+                            metadata['minifigure']['year'] = -1
+                            self.logger.warning(f"No year found for {set_num}, setting to -1")
+                        
+                        # Save updated metadata
+                        with open(metadata_file, 'w') as f:
+                            yaml.dump(metadata, f)
+                    
+                    except requests.exceptions.RequestException as e:
+                        self.logger.warning(f"Failed to update {set_num}: {e}")
+                        # Ensure year is set to -1 if update fails
+                        metadata['minifigure']['year'] = -1
+                        with open(metadata_file, 'w') as f:
+                            yaml.dump(metadata, f)
+                        continue
+                    
+                    time.sleep(1)  # Rate limiting
+                
+                except Exception as e:
+                    self.logger.warning(f"Error processing {metadata_file.name}: {e}")
+                    continue
+                
+                pbar.update(1)
+        
+        # Print summary
+        self.logger.info(f"""
+Update Summary:
+--------------
+Total minifigures checked: {len(metadata_files)}
+Minifigures with missing years: {len(incomplete_minifigs)}
+Successfully updated: {updated_count}
+Remaining with year = -1: {len(incomplete_minifigs) - updated_count}
+""")
+        
+        return updated_count
+
+    def collect_data(self, limit=None):
+        """Main data collection process"""
+        try:
+            # Get minifigures
+            minifigs = self.get_official_minifigs(limit=limit)
+            
+            # Download images and save metadata
+            successful_downloads = 0
+            with tqdm(minifigs, desc="Downloading images") as pbar:
+                for minifig in pbar:
+                    if minifig.get('set_img_url'):
+                        image_path = self.images_dir / f"{minifig['set_num']}.png"
                         if not image_path.exists():
                             if self.download_image(minifig['set_img_url'], image_path):
-                                self.save_metadata(minifig)
                                 successful_downloads += 1
-                            time.sleep(0.5)
+                    
+                    # Save metadata
+                    self.save_metadata(minifig)
                     pbar.update(1)
             
-            # Update summary with new downloads
-            summary['downloaded_images'] += successful_downloads
-            with open(summary_file, 'w') as f:
-                yaml.dump(summary, f)
+            # Print summary
+            total_minifigs = len(self.get_existing_minifigs())
+            years = [m['year'] for m in minifigs if isinstance(m['year'], int) and m['year'] != -1]
+            year_range = f"{min(years)}-{max(years)}" if years else "unknown"
             
             self.logger.info(f"""
 Dataset collection completed:
-- Total minifigures: {summary['total_minifigs']}
+- Total minifigures: {total_minifigs}
 - New minifigures added: {len(minifigs)}
-- Total images downloaded: {summary['downloaded_images']}
-- Year range: {summary['year_range']}
-            """)
+- Total images downloaded: {successful_downloads}
+- Year range: {year_range}
+""")
             
         except Exception as e:
             self.logger.error(f"Error during data collection: {e}")
             raise
 
+    def print_detailed_count(self):
+        """Print detailed count of minifigures and images"""
+        metadata_files = list(self.metadata_dir.glob('*.yaml'))
+        standard_images = list(self.images_dir.glob('*.png')) + list(self.images_dir.glob('*.jpg'))
+        
+        custom_dir = self.images_dir / 'custom'
+        custom_dirs = []
+        custom_images = []
+        if custom_dir.exists():
+            custom_dirs = list(custom_dir.glob('custom-*'))
+            for d in custom_dirs:
+                custom_images.extend(list(d.glob(f'{d.name}-*.png')))
+                custom_images.extend(list(d.glob(f'{d.name}-*.jpg')))
+
+        self.logger.info(f"""
+Detailed Dataset Count:
+----------------------
+Metadata files: {len(metadata_files)}
+Standard images: {len(standard_images)}
+Custom directories: {len(custom_dirs)}
+Custom images: {len(custom_images)}
+
+Total images: {len(standard_images) + len(custom_images)}
+
+Directory Structure:
+------------------
+dataset/
+└── images/train/
+    ├── Standard images: {len(standard_images)} files
+    └── custom/
+        └── Custom dirs: {len(custom_dirs)} with {len(custom_images)} total images
+
+Verification:
+-----------
+- Metadata without images: {sum(1 for m in metadata_files if not any(img.stem.startswith(Path(m).stem) for img in standard_images + custom_images))}
+- Images without metadata: {sum(1 for img in standard_images if not (self.metadata_dir / f"{img.stem}.yaml").exists())}
+""")
+
 def main():
-    # Get number of minifigures to collect from user input
-    limit_input = input("Enter number of minifigures to collect (press Enter for all): ").strip()
-    limit = int(limit_input) if limit_input else None
-    
-    # Initialize and run collector
-    collector = MinifigureDataCollector()
-    collector.collect_data(limit=limit)
+    try:
+        # Ask user what they want to do
+        print("\nChoose an option:")
+        print("1. Collect new minifigures")
+        print("2. Update existing minifigures with missing years")
+        print("3. Both collect new and update existing")
+        
+        choice = input("Enter your choice (1-3): ").strip()
+        
+        collector = MinifigureDataCollector()
+        
+        if choice == '1':
+            # Collect new minifigures
+            limit_input = input("Enter number of minifigures to collect (press Enter for all): ").strip()
+            limit = int(limit_input) if limit_input else None
+            collector.collect_data(limit=limit)
+            
+        elif choice == '2':
+            # Update existing minifigures
+            collector.update_incomplete_minifigs()
+            
+        elif choice == '3':
+            # Both collect new and update existing
+            limit_input = input("Enter number of minifigures to collect (press Enter for all): ").strip()
+            limit = int(limit_input) if limit_input else None
+            collector.collect_data(limit=limit)
+            collector.update_incomplete_minifigs()
+        
+        else:
+            print("Invalid choice!")
+            return
+        
+        collector.print_detailed_count()
+        
+    except KeyboardInterrupt:
+        print("\nOperation interrupted by user")
+    except Exception as e:
+        print(f"Error: {e}")
 
 if __name__ == "__main__":
     main()

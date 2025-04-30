@@ -183,6 +183,7 @@ class MinifigureDataPreprocessor:
             self.logger.warning("Failed images: " + ", ".join(failed_images))
         
         return processed_images, valid_metadata
+    
     def encode_labels(self, metadata_list):
         """Encode categorical labels"""
         # Extract years and themes
@@ -197,17 +198,30 @@ class MinifigureDataPreprocessor:
         encoded_years = self.year_encoder.transform(years)
         encoded_themes = self.theme_encoder.transform(themes)
         
-        # Save encoders mapping
+        # Convert numpy values to native Python types
+        year_mapping = {}
+        for year in self.year_encoder.classes_:
+            year_val = int(year) if isinstance(year, (np.integer, int)) else str(year)
+            encoded_val = int(self.year_encoder.transform([year])[0])
+            year_mapping[year_val] = encoded_val
+
+        theme_mapping = {}
+        for theme in self.theme_encoder.classes_:
+            theme_val = str(theme)
+            encoded_val = int(self.theme_encoder.transform([theme])[0])
+            theme_mapping[theme_val] = encoded_val
+
+        # Create plain dictionary for saving
         encoders_mapping = {
-            'year_mapping': dict(zip(self.year_encoder.classes_, self.year_encoder.transform(self.year_encoder.classes_))),
-            'theme_mapping': dict(zip(self.theme_encoder.classes_, self.theme_encoder.transform(self.theme_encoder.classes_)))
+            'year_mapping': year_mapping,
+            'theme_mapping': theme_mapping
         }
         
+        # Save in plain YAML format
         with open(self.labels_dir / 'encoders_mapping.yaml', 'w') as f:
-            yaml.dump(encoders_mapping, f)
+            yaml.dump(encoders_mapping, f, default_flow_style=False)
         
         return encoded_years, encoded_themes
-
     def preprocess_data(self, target_size=(224, 224)):
         """Main preprocessing pipeline"""
         try:

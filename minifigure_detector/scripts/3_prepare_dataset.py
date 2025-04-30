@@ -11,6 +11,7 @@ from tensorflow.keras import layers, models, optimizers
 from tensorflow.keras.callbacks import ModelCheckpoint, EarlyStopping, TensorBoard, ReduceLROnPlateau
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import classification_report
+from sklearn.preprocessing import LabelEncoder
 
 class MinifigureModelTrainer:
     def __init__(self):
@@ -51,24 +52,31 @@ class MinifigureModelTrainer:
             self.years = np.load(self.labels_dir / 'years.npy')
             self.themes = np.load(self.labels_dir / 'themes.npy')
             
-            # Load mappings
+            # Load encoders mapping
             with open(self.labels_dir / 'encoders_mapping.yaml', 'r') as f:
                 self.encoders_mapping = yaml.safe_load(f)
             
+            # Get number of classes from the mappings
             self.num_years = len(self.encoders_mapping['year_mapping'])
             self.num_themes = len(self.encoders_mapping['theme_mapping'])
             
+            # Load metadata mapping
+            with open(self.labels_dir / 'metadata_mapping.yaml', 'r') as f:
+                self.metadata_mapping = yaml.safe_load(f)
+            
             self.logger.info(f"""
-Data loaded successfully:
-- Images: {self.images.shape}
-- Years: {self.years.shape} (unique: {self.num_years})
-- Themes: {self.themes.shape} (unique: {self.num_themes})
-""")
+    Data loaded successfully:
+    - Images shape: {self.images.shape}
+    - Years shape: {self.years.shape} (unique: {self.num_years})
+    - Themes shape: {self.themes.shape} (unique: {self.num_themes})
+    - Year classes: {', '.join(map(str, self.encoders_mapping['year_mapping'].keys()))}
+    - Theme classes: {', '.join(map(str, self.encoders_mapping['theme_mapping'].keys()))}
+    """)
             
         except Exception as e:
             self.logger.error(f"Error loading data: {e}")
             raise
-
+        
     def create_model(self):
         """Create and compile the model"""
         # Base model - EfficientNetB0
@@ -123,7 +131,6 @@ Data loaded successfully:
     def create_callbacks(self, model_name):
         """Create training callbacks"""
         callbacks = [
-            # Model checkpoint
             ModelCheckpoint(
                 filepath=self.models_dir / f'{model_name}_best.h5',
                 monitor='val_loss',
@@ -131,14 +138,12 @@ Data loaded successfully:
                 mode='min',
                 verbose=1
             ),
-            # Early stopping
             EarlyStopping(
                 monitor='val_loss',
                 patience=10,
                 restore_best_weights=True,
                 verbose=1
             ),
-            # Learning rate reduction
             ReduceLROnPlateau(
                 monitor='val_loss',
                 factor=0.2,
@@ -146,7 +151,6 @@ Data loaded successfully:
                 min_lr=1e-6,
                 verbose=1
             ),
-            # TensorBoard logging
             TensorBoard(
                 log_dir=self.logs_dir / datetime.now().strftime("%Y%m%d-%H%M%S"),
                 histogram_freq=1
@@ -205,12 +209,12 @@ Data loaded successfully:
             year_report = classification_report(
                 y_year_val,
                 y_pred_year,
-                target_names=list(self.encoders_mapping['year_mapping'].keys())
+                target_names=[str(k) for k in self.encoders_mapping['year_mapping'].keys()]
             )
             theme_report = classification_report(
                 y_theme_val,
                 y_pred_theme,
-                target_names=list(self.encoders_mapping['theme_mapping'].keys())
+                target_names=[str(k) for k in self.encoders_mapping['theme_mapping'].keys()]
             )
             
             # Save reports
