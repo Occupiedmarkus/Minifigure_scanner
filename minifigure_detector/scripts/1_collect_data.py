@@ -1,5 +1,6 @@
 import os
 import time
+import json
 import logging
 import requests
 import yaml
@@ -39,6 +40,142 @@ class MinifigureDataCollector:
             return set()
         return {p.stem for p in self.metadata_dir.glob('*.yaml')}
 
+    def extract_base_fig_id(self, filename):
+        """Extract the base figure ID from a filename"""
+        # Split by underscore and take the first part
+        base_id = filename.split('_')[0]
+        # Remove file extension if present
+        base_id = base_id.split('.')[0]
+        return base_id
+
+    def get_minifig_data(self, fig_id):
+        """Get minifigure data from API"""
+        try:
+            response = self.make_api_request(f"{self.base_url}/minifigs/{fig_id}/")
+            if response:
+                return response
+        except Exception as e:
+            self.logger.warning(f"Could not get data for {fig_id}: {e}")
+        return None
+
+    def make_api_request(self, url, headers=None, params=None, retry_count=3, base_delay=1):
+        """Handle rate limits with exponential backoff"""
+        if headers is None:
+            headers = {'Authorization': f'key {self.api_key}'}
+        
+        for attempt in range(retry_count):
+            try:
+                response = requests.get(url, headers=headers, params=params, timeout=10)
+                
+                if response.status_code == 200:
+                    return response.json()
+                
+                if response.status_code == 429:  # Rate limit hit
+                    wait_time = base_delay * (2 ** attempt)  # Exponential backoff
+                    self.logger.warning(f"Rate limit hit, waiting {wait_time} seconds...")
+                    time.sleep(wait_time)
+                    continue
+                    
+                response.raise_for_status()
+                
+            except requests.exceptions.RequestException as e:
+                if attempt == retry_count - 1:
+                    raise
+                wait_time = base_delay * (2 ** attempt)
+                self.logger.warning(f"Request failed, retrying in {wait_time} seconds... Error: {e}")
+                time.sleep(wait_time)
+        
+        return None
+
+    def recreate_metadata(self, image_path, metadata_path):
+        """Recreate metadata with support for multiple images per figure"""
+        # Get the base figure ID
+        base_fig_id = self.extract_base_fig_id(os.path.basename(image_path))
+        
+        try:
+            metadata = self.get_minifig_data(base_fig_id)
+            if metadata:
+                # Save metadata using the full image filename
+                save_path = os.path.join(metadata_path, f"{os.path.basename(image_path)}.yaml")
+                
+                formatted_metadata = {
+                    'minifigure': {
+                        'set_num': metadata.get('set_num', base_fig_id),
+                        'name': metadata.get('name', 'Unknown'),
+                        'year': metadata.get('year', -1),
+                        'theme': metadata.get('theme_id', 'unknown'),
+                        'category': 'official'
+                    }
+                }
+                
+                with open(save_path, 'w') as f:
+                    yaml.dump(formatted_metadata, f)
+                return True
+        except Exception as e:
+            self.logger.warning(f"Could not get data for {base_fig_id} from API: {e}")
+        return False
+      # Add path for custom minifigures file
+        self.custom_figs_file = self.base_dir / 'labels' / 'custom_minifigures.yaml'
+        
+    def load_custom_minifigures(self):
+        """Load custom minifigures configuration"""
+        if self.custom_figs_file.exists():
+            try:
+                with open(self.custom_figs_file, 'r') as f:
+                    return yaml.safe_load(f) or {}
+            except Exception as e:
+                self.logger.warning(f"Could not load custom minifigures: {e}")
+        return {}
+
+    def check_orphaned_metadata(self, image_folder, metadata_folder):
+        """Check for orphaned metadata files with support for multiple images"""
+        metadata_files = set(f.replace('.yaml', '') for f in os.listdir(metadata_folder) 
+                           if f.endswith('.yaml'))
+        image_files = set()
+        
+        # Get all image files, including those in subdirectories
+        for root, _, files in os.walk(image_folder):
+            for file in files:
+                if file.lower().endswith(('.jpg', '.jpeg', '.png')):
+                    image_files.add(os.path.splitext(file)[0])
+
+        # Filter out metadata files that belong to custom figures
+        orphaned = set()
+        for metadata_file in metadata_files:
+            # Skip if filename starts with 'custom-'
+            if metadata_file.startswith('custom-'):
+                continue
+                
+            # Check if there's a corresponding image
+            if metadata_file not in image_files:
+                orphaned.add(metadata_file)
+
+        if orphaned:
+            self.logger.info("\nFound metadata files without corresponding images:")
+            for file in sorted(orphaned):
+                self.logger.info(f"- {file}")
+
+        return orphaned
+
+    def clean_orphaned_data(self, image_folder, metadata_folder):
+        """Clean orphaned data with support for multiple images and custom figures"""
+        orphaned = self.check_orphaned_metadata(image_folder, metadata_folder)
+        cleaned = 0
+
+        for file in orphaned:
+            # Skip if filename starts with 'custom-'
+            if file.startswith('custom-'):
+                continue
+                
+            # Remove orphaned metadata
+            metadata_path = os.path.join(metadata_folder, f"{file}.yaml")
+            if os.path.exists(metadata_path):
+                os.remove(metadata_path)
+                cleaned += 1
+
+        return cleaned
+
+
     def get_official_minifigs(self, min_year=1975, limit=None):
         """Get official LEGO minifigures with maximum batch size"""
         MAX_PAGE_SIZE = 1000  # Maximum items per page
@@ -52,7 +189,6 @@ class MinifigureDataCollector:
         self.logger.info(f"Found {len(existing_minifigs)} existing minifigures")
         
         pbar = tqdm(desc="Collecting minifigures", unit="minifigs")
-        
         while True:
             try:
                 if limit and len(minifigs) >= limit:
@@ -128,8 +264,6 @@ class MinifigureDataCollector:
         
         pbar.close()
         return minifigs
-
-
     def download_image(self, url, path):
         """Download image from URL"""
         try:
@@ -162,321 +296,6 @@ class MinifigureDataCollector:
         except Exception as e:
             self.logger.warning(f"Failed to save metadata for {minifig['set_num']}: {e}")
             return False
-
-    def update_incomplete_minifigs(self):
-        """Update existing minifigures with missing or -1 years"""
-        headers = {'Authorization': f'key {self.api_key}'}
-        updated_count = 0
-        
-        # Get all metadata files
-        metadata_files = list(self.metadata_dir.glob('*.yaml'))
-        
-        # Filter for minifigs with year == -1 or 'unknown'
-        incomplete_minifigs = []
-        for metadata_file in metadata_files:
-            with open(metadata_file, 'r') as f:
-                metadata = yaml.safe_load(f)
-                minifig = metadata.get('minifigure', {})
-                year = minifig.get('year')
-                if year == -1 or year == 'unknown':
-                    incomplete_minifigs.append((metadata_file, metadata))
-        
-        self.logger.info(f"Found {len(incomplete_minifigs)} minifigures with missing years (year = -1 or 'unknown')")
-        
-        with tqdm(incomplete_minifigs, desc="Updating minifigures") as pbar:
-            for metadata_file, metadata in pbar:
-                try:
-                    set_num = metadata['minifigure']['set_num']
-                    current_year = metadata['minifigure']['year']
-                    
-                    self.logger.info(f"Updating {set_num} (current year: {current_year})")
-                    
-                    # First try getting year from minifig details
-                    try:
-                        minifig_response = requests.get(
-                            f"{self.base_url}/minifigs/{set_num}/",
-                            headers=headers,
-                            timeout=10
-                        )
-                        minifig_response.raise_for_status()
-                        minifig_data = minifig_response.json()
-                        
-                        if minifig_data.get('year'):
-                            try:
-                                new_year = int(minifig_data['year'])
-                                metadata['minifigure']['year'] = new_year
-                                self.logger.info(f"Found year {new_year} for {set_num} from minifig details")
-                                updated_count += 1
-                                
-                                # Save updated metadata
-                                with open(metadata_file, 'w') as f:
-                                    yaml.dump(metadata, f)
-                                continue
-                            except (ValueError, TypeError):
-                                pass
-                        
-                        # If still no year, try getting from sets
-                        time.sleep(1)  # Rate limiting
-                        sets_response = requests.get(
-                            f"{self.base_url}/minifigs/{set_num}/sets/",
-                            headers=headers,
-                            timeout=10
-                        )
-                        sets_response.raise_for_status()
-                        sets_data = sets_response.json()
-                        
-                        years = []
-                        if sets_data.get('results'):
-                            for set_info in sets_data['results']:
-                                time.sleep(1)  # Rate limiting
-                                set_detail_response = requests.get(
-                                    f"{self.base_url}/sets/{set_info['set_num']}/",
-                                    headers=headers,
-                                    timeout=10
-                                )
-                                if set_detail_response.status_code == 200:
-                                    set_detail = set_detail_response.json()
-                                    if set_detail.get('year'):
-                                        try:
-                                            years.append(int(set_detail['year']))
-                                        except (ValueError, TypeError):
-                                            continue
-                        
-                        if years:
-                            new_year = min(years)  # First appearance year
-                            metadata['minifigure']['year'] = new_year
-                            self.logger.info(f"Found year {new_year} for {set_num} from sets")
-                            updated_count += 1
-                        else:
-                            # If still no year found, ensure it's set to -1
-                            metadata['minifigure']['year'] = -1
-                            self.logger.warning(f"No year found for {set_num}, setting to -1")
-                        
-                        # Save updated metadata
-                        with open(metadata_file, 'w') as f:
-                            yaml.dump(metadata, f)
-                    
-                    except requests.exceptions.RequestException as e:
-                        self.logger.warning(f"Failed to update {set_num}: {e}")
-                        # Ensure year is set to -1 if update fails
-                        metadata['minifigure']['year'] = -1
-                        with open(metadata_file, 'w') as f:
-                            yaml.dump(metadata, f)
-                        continue
-                    
-                    time.sleep(1)  # Rate limiting
-                
-                except Exception as e:
-                    self.logger.warning(f"Error processing {metadata_file.name}: {e}")
-                    continue
-                
-                pbar.update(1)
-        
-        # Print summary
-        self.logger.info(f"""
-Update Summary:
---------------
-Total minifigures checked: {len(metadata_files)}
-Minifigures with missing years: {len(incomplete_minifigs)}
-Successfully updated: {updated_count}
-Remaining with year = -1: {len(incomplete_minifigs) - updated_count}
-""")
-        
-        return updated_count
-    def make_api_request(self, url, headers=None, params=None, retry_count=3, base_delay=1):
-        """Handle rate limits with exponential backoff"""
-        if headers is None:
-            headers = {'Authorization': f'key {self.api_key}'}
-        
-        for attempt in range(retry_count):
-            try:
-                response = requests.get(url, headers=headers, params=params, timeout=10)
-                
-                if response.status_code == 200:
-                    return response.json()
-                
-                if response.status_code == 429:  # Rate limit hit
-                    wait_time = base_delay * (2 ** attempt)  # Exponential backoff
-                    self.logger.warning(f"Rate limit hit, waiting {wait_time} seconds...")
-                    time.sleep(wait_time)
-                    continue
-                    
-                response.raise_for_status()
-                
-            except requests.exceptions.RequestException as e:
-                if attempt == retry_count - 1:
-                    raise
-                wait_time = base_delay * (2 ** attempt)
-                self.logger.warning(f"Request failed, retrying in {wait_time} seconds... Error: {e}")
-                time.sleep(wait_time)
-        
-        return None
-
-    def validate_and_repair_dataset(self):
-        """Validate and repair dataset, handling missing or incomplete metadata"""
-        self.logger.info("Starting dataset validation and repair...")
-        
-        # Get all files
-        image_files = list(self.images_dir.glob('*.png')) + list(self.images_dir.glob('*.jpg'))
-        metadata_files = list(self.metadata_dir.glob('*.yaml'))
-        
-        # Create mappings
-        image_ids = {img.stem for img in image_files}
-        metadata_ids = {meta.stem for meta in metadata_files}
-        
-        # Find discrepancies
-        images_without_metadata = image_ids - metadata_ids
-        metadata_without_images = metadata_ids - image_ids
-        
-        self.logger.info(f"""
-Found discrepancies:
-- Images without metadata: {len(images_without_metadata)}
-- Metadata without images: {len(metadata_without_images)}
-""")
-
-        # 1. Handle images without metadata
-        if images_without_metadata:
-            self.logger.info("Attempting to recreate metadata for images without metadata...")
-            headers = {'Authorization': f'key {self.api_key}'}
-            
-            with tqdm(images_without_metadata, desc="Recreating metadata") as pbar:
-                for img_id in pbar:
-                    try:
-                        # Try to get minifig details from API
-                        minifig_response = requests.get(
-                            f"{self.base_url}/minifigs/{img_id}/",
-                            headers=headers,
-                            timeout=10
-                        )
-                        
-                        if minifig_response.status_code == 200:
-                            minifig_data = minifig_response.json()
-                            
-                            # Get year using our existing year-finding logic
-                            year = -1
-                            if minifig_data.get('year'):
-                                try:
-                                    year = int(minifig_data['year'])
-                                except (ValueError, TypeError):
-                                    pass
-                            
-                            if year == -1:
-                                # Try getting year from sets
-                                sets_response = requests.get(
-                                    f"{self.base_url}/minifigs/{img_id}/sets/",
-                                    headers=headers,
-                                    timeout=10
-                                )
-                                if sets_response.status_code == 200:
-                                    sets_data = sets_response.json()
-                                    years = []
-                                    
-                                    for set_info in sets_data.get('results', []):
-                                        set_detail_response = requests.get(
-                                            f"{self.base_url}/sets/{set_info['set_num']}/",
-                                            headers=headers,
-                                            timeout=10
-                                        )
-                                        if set_detail_response.status_code == 200:
-                                            set_detail = set_detail_response.json()
-                                            if set_detail.get('year'):
-                                                try:
-                                                    years.append(int(set_detail['year']))
-                                                except (ValueError, TypeError):
-                                                    continue
-                                    
-                                    if years:
-                                        year = min(years)
-                            
-                            # Create metadata
-                            metadata = {
-                                'minifigure': {
-                                    'set_num': img_id,
-                                    'name': minifig_data.get('name', 'Unknown'),
-                                    'year': year,
-                                    'theme': minifig_data.get('theme_id', 'unknown'),
-                                    'category': 'official'
-                                }
-                            }
-                            
-                            # Save metadata
-                            metadata_path = self.metadata_dir / f"{img_id}.yaml"
-                            with open(metadata_path, 'w') as f:
-                                yaml.dump(metadata, f)
-                                
-                            self.logger.info(f"Created metadata for {img_id}")
-                        else:
-                            self.logger.warning(f"Could not get data for {img_id} from API")
-                            
-                        time.sleep(1)  # Rate limiting
-                        
-                    except Exception as e:
-                        self.logger.error(f"Error processing {img_id}: {e}")
-                        continue
-                    
-                    pbar.update(1)
-
-        # 2. Option to remove orphaned metadata files
-        if metadata_without_images:
-            print("\nFound metadata files without corresponding images:")
-            for meta_id in metadata_without_images:
-                print(f"- {meta_id}")
-            
-            choice = input("\nWould you like to remove these orphaned metadata files? (y/n): ").strip().lower()
-            if choice == 'y':
-                for meta_id in metadata_without_images:
-                    try:
-                        (self.metadata_dir / f"{meta_id}.yaml").unlink()
-                        self.logger.info(f"Removed orphaned metadata: {meta_id}")
-                    except Exception as e:
-                        self.logger.error(f"Error removing {meta_id}: {e}")
-
-        # 3. Validate all remaining metadata files
-        self.logger.info("Validating remaining metadata files...")
-        invalid_metadata = []
-        
-        with tqdm(metadata_files, desc="Validating metadata") as pbar:
-            for meta_file in pbar:
-                try:
-                    with open(meta_file, 'r') as f:
-                        metadata = yaml.safe_load(f)
-                    
-                    # Check required fields
-                    required_fields = ['set_num', 'name', 'year', 'theme', 'category']
-                    if not all(field in metadata.get('minifigure', {}) for field in required_fields):
-                        invalid_metadata.append(meta_file.stem)
-                        
-                except Exception as e:
-                    self.logger.error(f"Error validating {meta_file.name}: {e}")
-                    invalid_metadata.append(meta_file.stem)
-                
-                pbar.update(1)
-        
-        if invalid_metadata:
-            self.logger.warning(f"Found {len(invalid_metadata)} invalid metadata files")
-            print("\nInvalid metadata files:")
-            for meta_id in invalid_metadata:
-                print(f"- {meta_id}")
-            
-            choice = input("\nWould you like to attempt to repair these files? (y/n): ").strip().lower()
-            if choice == 'y':
-                # Attempt to repair invalid metadata files
-                self.update_incomplete_minifigs()
-
-        # Final report
-        self.logger.info(f"""
-Repair Summary:
---------------
-Initial state:
-- Images without metadata: {len(images_without_metadata)}
-- Metadata without images: {len(metadata_without_images)}
-- Invalid metadata files: {len(invalid_metadata)}
-
-Final state:
-- Metadata recreated: {len(images_without_metadata)}
-- Orphaned metadata removed: {len(metadata_without_images) if 'choice' in locals() and choice == 'y' else 0}
-- Invalid metadata repaired: {len(invalid_metadata) if 'choice' in locals() and choice == 'y' else 0}
-""")
 
     def collect_data(self, limit=None):
         """Main data collection process"""
@@ -514,80 +333,92 @@ Dataset collection completed:
         except Exception as e:
             self.logger.error(f"Error during data collection: {e}")
             raise
+def display_menu():
+    """Display the main menu"""
+    print("\nMinifigure Data Collection Tool")
+    print("-------------------------------")
+    print("1. Collect new minifigure data")
+    print("2. Check dataset integrity")
+    print("3. Clean orphaned metadata")
+    print("4. View dataset statistics")
+    print("5. Exit")
+    return input("\nSelect an option (1-5): ")
 
-    def print_detailed_count(self):
-        """Print detailed count of minifigures and images"""
-        metadata_files = list(self.metadata_dir.glob('*.yaml'))
-        standard_images = list(self.images_dir.glob('*.png')) + list(self.images_dir.glob('*.jpg'))
-        
-        custom_dir = self.images_dir / 'custom'
-        custom_dirs = []
-        custom_images = []
-        if custom_dir.exists():
-            custom_dirs = list(custom_dir.glob('custom-*'))
-            for d in custom_dirs:
-                custom_images.extend(list(d.glob(f'{d.name}-*.png')))
-                custom_images.extend(list(d.glob(f'{d.name}-*.jpg')))
-
-        self.logger.info(f"""
-Detailed Dataset Count:
-----------------------
-Metadata files: {len(metadata_files)}
-Standard images: {len(standard_images)}
-Custom directories: {len(custom_dirs)}
-Custom images: {len(custom_images)}
-
-Total images: {len(standard_images) + len(custom_images)}
-
-Directory Structure:
-------------------
-dataset/
-└── images/train/
-    ├── Standard images: {len(standard_images)} files
-    └── custom/
-        └── Custom dirs: {len(custom_dirs)} with {len(custom_images)} total images
-
-Verification:
------------
-- Metadata without images: {sum(1 for m in metadata_files if not any(img.stem.startswith(Path(m).stem) for img in standard_images + custom_images))}
-- Images without metadata: {sum(1 for img in standard_images if not (self.metadata_dir / f"{img.stem}.yaml").exists())}
-""")
+def count_minifigures(collector):
+    """Count official and custom minifigures"""
+    official_count = 0
+    custom_count = 0
+    
+    # Count from metadata files
+    for metadata_file in collector.metadata_dir.glob('*.yaml'):
+        if metadata_file.stem.startswith('custom-'):
+            custom_count += 1
+        else:
+            official_count += 1
+            
+    return official_count, custom_count
 
 def main():
     try:
-        print("\nChoose an option:")
-        print("1. Collect new minifigures")
-        print("2. Update existing minifigures with missing years")
-        print("3. Both collect new and update existing")
-        print("4. Validate and repair dataset")
-        
-        choice = input("Enter your choice (1-4): ").strip()
-        
+        # Initialize collector
         collector = MinifigureDataCollector()
         
-        if choice == '1':
-            limit_input = input("Enter number of minifigures to collect (press Enter for all): ").strip()
-            limit = int(limit_input) if limit_input else None
-            collector.collect_data(limit=limit)
-        elif choice == '2':
-            collector.update_incomplete_minifigs()
-        elif choice == '3':
-            limit_input = input("Enter number of minifigures to collect (press Enter for all): ").strip()
-            limit = int(limit_input) if limit_input else None
-            collector.collect_data(limit=limit)
-            collector.update_incomplete_minifigs()
-        elif choice == '4':
-            collector.validate_and_repair_dataset()
-        else:
-            print("Invalid choice!")
-            return
-        
-        collector.print_detailed_count()
-        
+        while True:
+            choice = display_menu()
+            
+            if choice == '1':
+                print("\nCollecting new minifigure data...")
+                collector.collect_data()
+                
+            elif choice == '2':
+                print("\nChecking dataset integrity...")
+                orphaned = collector.check_orphaned_metadata(
+                    str(collector.images_dir),
+                    str(collector.metadata_dir)
+                )
+                if not orphaned:
+                    print("Dataset integrity verified - no orphaned files found")
+                
+            elif choice == '3':
+                print("\nCleaning orphaned metadata files...")
+                confirm = input("Are you sure you want to clean orphaned metadata? (y/n): ")
+                if confirm.lower() == 'y':
+                    cleaned = collector.clean_orphaned_data(
+                        str(collector.images_dir),
+                        str(collector.metadata_dir)
+                    )
+                    print(f"Cleaned {cleaned} orphaned metadata files")
+                else:
+                    print("Operation cancelled")
+                
+            elif choice == '4':
+                # Get detailed statistics
+                official_count, custom_count = count_minifigures(collector)
+                total_images = len(list(collector.images_dir.glob('*.[pj][np][g]*')))
+                
+                print("\nDataset Statistics")
+                print("-----------------")
+                print(f"Official minifigures: {official_count}")
+                print(f"Custom minifigures: {custom_count}")
+                print(f"Total minifigures: {official_count + custom_count}")
+                print(f"Total images: {total_images}")
+                
+            elif choice == '5':
+                print("\nExiting...")
+                break
+                
+            else:
+                print("\nInvalid option. Please try again.")
+            
+            input("\nPress Enter to continue...")
+            
     except KeyboardInterrupt:
-        print("\nOperation interrupted by user")
+        print("\nScript interrupted by user")
+        sys.exit(1)
     except Exception as e:
-        print(f"Error: {e}")
+        print(f"\nAn error occurred: {e}")
+        sys.exit(1)
 
 if __name__ == "__main__":
+    import sys
     main()
