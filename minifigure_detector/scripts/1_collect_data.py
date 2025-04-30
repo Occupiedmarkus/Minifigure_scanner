@@ -39,143 +39,96 @@ class MinifigureDataCollector:
             return set()
         return {p.stem for p in self.metadata_dir.glob('*.yaml')}
 
-    def get_official_minifigs(self, page_size=50, min_year=1975, limit=None):
-        """Get official LEGO minifigures with pagination"""
+    def get_official_minifigs(self, min_year=1975, limit=None):
+        """Get official LEGO minifigures with maximum batch size"""
+        MAX_PAGE_SIZE = 1000  # Maximum items per page
+        MAX_BATCH_SIZE = 50   # Maximum minifigs per batch request
+        
         headers = {'Authorization': f'key {self.api_key}'}
         minifigs = []
         page = 1
         
-        # Get existing minifigs to skip
         existing_minifigs = self.get_existing_minifigs()
         self.logger.info(f"Found {len(existing_minifigs)} existing minifigures")
         
-        self.logger.info(f"Collecting official minifigures from year {min_year} onwards...")
         pbar = tqdm(desc="Collecting minifigures", unit="minifigs")
         
         while True:
             try:
-                # Break if we've reached the limit
                 if limit and len(minifigs) >= limit:
                     break
                 
-                # Make API request for minifigs list
+                # 1. Get maximum page size of minifigures
                 params = {
-                    'page_size': page_size,
+                    'page_size': MAX_PAGE_SIZE,
                     'page': page,
                     'min_year': min_year,
                     'ordering': 'year'
                 }
                 
-                response = requests.get(
-                    f"{self.base_url}/minifigs/",
-                    headers=headers,
-                    params=params,
-                    timeout=10
-                )
-                response.raise_for_status()
-                data = response.json()
-                
-                if not data.get('results'):
+                data = self.make_api_request(f"{self.base_url}/minifigs/", params=params)
+                if not data or not data.get('results'):
                     break
                 
-                # Process results
-                for fig in data['results']:
-                    # Skip if we've reached the limit
-                    if limit and len(minifigs) >= limit:
-                        break
+                # 2. Filter new minifigures
+                new_figs = [
+                    fig for fig in data['results']
+                    if fig['set_num'] not in existing_minifigs
+                    and (not limit or len(minifigs) < limit)
+                ]
+                
+                # 3. Process in batches of 50
+                for i in range(0, len(new_figs), MAX_BATCH_SIZE):
+                    batch = new_figs[i:i + MAX_BATCH_SIZE]
+                    set_nums = ','.join(fig['set_num'] for fig in batch)
                     
-                    # Skip if already exists
-                    if fig['set_num'] in existing_minifigs:
-                        continue
+                    # Get batch details
+                    batch_details = self.make_api_request(
+                        f"{self.base_url}/minifigs/",
+                        params={
+                            'set_nums': set_nums,
+                            'inc_parts': 0
+                        }
+                    )
                     
-                    try:
-                        # First try getting year from the minifig's own details
-                        minifig_response = requests.get(
-                            f"{self.base_url}/minifigs/{fig['set_num']}/",
-                            headers=headers,
-                            timeout=10
-                        )
-                        minifig_response.raise_for_status()
-                        minifig_data = minifig_response.json()
-                        
-                        # Try to get year from the minifig's details
-                        if minifig_data.get('year'):
+                    if batch_details and batch_details.get('results'):
+                        for fig, details in zip(batch, batch_details['results']):
                             try:
-                                fig['year'] = int(minifig_data['year'])
-                                self.logger.debug(f"Found year {fig['year']} for {fig['set_num']} from minifig details")
-                            except (ValueError, TypeError):
-                                fig['year'] = -1
-                        else:
-                            fig['year'] = -1
-                        
-                        # Add theme and category
-                        fig['theme_id'] = minifig_data.get('theme_id', 'unknown')
-                        fig['category_id'] = minifig_data.get('category_id', 'unknown')
-
-                        # If no year found, try getting it from the sets
-                        if fig['year'] == -1:
-                            # Get all sets that contain this minifig
-                            sets_response = requests.get(
-                                f"{self.base_url}/minifigs/{fig['set_num']}/sets/",
-                                headers=headers,
-                                timeout=10
-                            )
-                            sets_response.raise_for_status()
-                            sets_data = sets_response.json()
-
-                            years = []
-                            if sets_data.get('results'):
-                                for set_info in sets_data['results']:
-                                    # Make another request to get detailed set info
-                                    set_detail_response = requests.get(
-                                        f"{self.base_url}/sets/{set_info['set_num']}/",
-                                        headers=headers,
-                                        timeout=10
-                                    )
-                                    if set_detail_response.status_code == 200:
-                                        set_detail = set_detail_response.json()
-                                        if set_detail.get('year'):
-                                            try:
-                                                years.append(int(set_detail['year']))
-                                            except (ValueError, TypeError):
-                                                continue
-
-                            if years:
-                                fig['year'] = min(years)  # First appearance year
-                                self.logger.debug(f"Found year {fig['year']} for {fig['set_num']} from sets")
-
-                        # Add delay to respect API rate limits
-                        time.sleep(1)
-
-                        # Log success or failure of year detection
-                        if fig['year'] != -1:
-                            self.logger.info(f"✓ {fig['set_num']} - {fig['name']}: Year {fig['year']} found")
-                        else:
-                            self.logger.warning(f"⚠ {fig['set_num']} - {fig['name']}: No year found")
-
-                        minifigs.append(fig)
-                        pbar.update(1)
-                        
-                    except requests.exceptions.RequestException as e:
-                        self.logger.warning(f"Failed to get details for {fig['set_num']}: {e}")
-                        continue
+                                # Process year and other details
+                                year = -1
+                                if details.get('year'):
+                                    try:
+                                        year = int(details['year'])
+                                    except (ValueError, TypeError):
+                                        pass
+                                
+                                fig.update({
+                                    'year': year,
+                                    'theme_id': details.get('theme_id', 'unknown'),
+                                    'category_id': details.get('category_id', 'unknown')
+                                })
+                                
+                                minifigs.append(fig)
+                                pbar.update(1)
+                                
+                            except Exception as e:
+                                self.logger.warning(f"Failed to process {fig['set_num']}: {e}")
+                                continue
                     
-                # Break if no more pages
+                    # Add delay between batches to respect rate limits
+                    time.sleep(1)
+                
                 if not data.get('next'):
                     break
-                
                 page += 1
-                time.sleep(1)  # Rate limiting between pages
                 
-            except requests.exceptions.RequestException as e:
-                self.logger.error(f"API request failed: {e}")
-                break
             except Exception as e:
-                self.logger.error(f"Error during minifigure collection: {e}")
+                self.logger.error(f"Error during batch processing: {e}")
                 break
         
         pbar.close()
         return minifigs
+
 
     def download_image(self, url, path):
         """Download image from URL"""
@@ -330,6 +283,34 @@ Remaining with year = -1: {len(incomplete_minifigs) - updated_count}
 """)
         
         return updated_count
+    def make_api_request(self, url, headers=None, params=None, retry_count=3, base_delay=1):
+        """Handle rate limits with exponential backoff"""
+        if headers is None:
+            headers = {'Authorization': f'key {self.api_key}'}
+        
+        for attempt in range(retry_count):
+            try:
+                response = requests.get(url, headers=headers, params=params, timeout=10)
+                
+                if response.status_code == 200:
+                    return response.json()
+                
+                if response.status_code == 429:  # Rate limit hit
+                    wait_time = base_delay * (2 ** attempt)  # Exponential backoff
+                    self.logger.warning(f"Rate limit hit, waiting {wait_time} seconds...")
+                    time.sleep(wait_time)
+                    continue
+                    
+                response.raise_for_status()
+                
+            except requests.exceptions.RequestException as e:
+                if attempt == retry_count - 1:
+                    raise
+                wait_time = base_delay * (2 ** attempt)
+                self.logger.warning(f"Request failed, retrying in {wait_time} seconds... Error: {e}")
+                time.sleep(wait_time)
+        
+        return None
 
     def validate_and_repair_dataset(self):
         """Validate and repair dataset, handling missing or incomplete metadata"""
