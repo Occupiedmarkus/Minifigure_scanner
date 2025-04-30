@@ -6,6 +6,8 @@ from pathlib import Path
 from dotenv import load_dotenv
 from datetime import datetime
 
+import gc
+
 import tensorflow as tf
 from tensorflow.keras import layers, models, optimizers
 from tensorflow.keras.callbacks import ModelCheckpoint, EarlyStopping, TensorBoard, ReduceLROnPlateau
@@ -13,6 +15,15 @@ from sklearn.model_selection import train_test_split
 from sklearn.metrics import classification_report
 from sklearn.preprocessing import LabelEncoder
 
+# Add at the start of the script to handle GPU/CUDA warnings
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'  # Reduce TensorFlow logging
+physical_devices = tf.config.list_physical_devices('GPU')
+if physical_devices:
+    try:
+        for device in physical_devices:
+            tf.config.experimental.set_memory_growth(device, True)
+    except:
+        print("Memory growth must be set before GPUs have been initialized")
 class MinifigureModelTrainer:
     def __init__(self):
         # Load environment variables
@@ -264,6 +275,75 @@ Training completed successfully:
         )
         
         return model
+
+
+def cleanup_memory():
+    """Clean up memory after heavy operations"""
+    gc.collect()
+    tf.keras.backend.clear_session()
+
+def create_model():
+    # Reduce model complexity if needed
+    base_model = tf.keras.applications.MobileNetV2(
+        input_shape=(224, 224, 3),
+        include_top=False,
+        weights='imagenet'
+    )
+    base_model.trainable = False  # Freeze the base model
+
+    model = tf.keras.Sequential([
+        base_model,
+        tf.keras.layers.GlobalAveragePooling2D(),
+        tf.keras.layers.Dense(256, activation='relu'),
+        tf.keras.layers.Dropout(0.5),
+        tf.keras.layers.Dense(num_classes, activation='softmax')
+    ])
+    return model
+
+def train_model(x_train, y_train, x_val, y_val):
+    model = create_model()
+    
+    # Reduce batch size to handle memory issues
+    batch_size = 16  # Reduced from default
+    
+    model.compile(
+        optimizer=tf.keras.optimizers.Adam(learning_rate=0.001),
+        loss='sparse_categorical_crossentropy',
+        metrics=['accuracy']
+    )
+
+    # Add early stopping to prevent unnecessary training
+    early_stopping = tf.keras.callbacks.EarlyStopping(
+        monitor='val_loss',
+        patience=10,
+        restore_best_weights=True
+    )
+
+    # Reduce memory usage during training
+    training_config = {
+        'batch_size': batch_size,
+        'epochs': 100,
+        'validation_data': (x_val, y_val),
+        'callbacks': [early_stopping],
+        'workers': 1,
+        'use_multiprocessing': False
+    }
+
+    history = model.fit(
+        x_train,
+        y_train,
+        **training_config
+    )
+    
+    return model, history
+def load_and_preprocess_data():
+    # Add batch processing for large datasets
+    batch_size = 32
+    
+    dataset = tf.data.Dataset.from_tensor_slices((x_train, y_train))
+    dataset = dataset.batch(batch_size).prefetch(tf.data.AUTOTUNE)
+    
+    return dataset
 
 def main():
     trainer = MinifigureModelTrainer()
