@@ -104,14 +104,16 @@ class MinifigureDataCollector:
                                 fig['year'] = int(minifig_data['year'])
                                 self.logger.debug(f"Found year {fig['year']} for {fig['set_num']} from minifig details")
                             except (ValueError, TypeError):
-                                fig['year'] = None
+                                fig['year'] = -1
+                        else:
+                            fig['year'] = -1
                         
                         # Add theme and category
                         fig['theme_id'] = minifig_data.get('theme_id', 'unknown')
                         fig['category_id'] = minifig_data.get('category_id', 'unknown')
 
                         # If no year found, try getting it from the sets
-                        if not fig.get('year'):
+                        if fig['year'] == -1:
                             # Get all sets that contain this minifig
                             sets_response = requests.get(
                                 f"{self.base_url}/minifigs/{fig['set_num']}/sets/",
@@ -141,14 +143,12 @@ class MinifigureDataCollector:
                             if years:
                                 fig['year'] = min(years)  # First appearance year
                                 self.logger.debug(f"Found year {fig['year']} for {fig['set_num']} from sets")
-                            else:
-                                fig['year'] = -1
 
                         # Add delay to respect API rate limits
                         time.sleep(1)
 
                         # Log success or failure of year detection
-                        if fig.get('year') and fig['year'] != -1:
+                        if fig['year'] != -1:
                             self.logger.info(f"✓ {fig['set_num']} - {fig['name']}: Year {fig['year']} found")
                         else:
                             self.logger.warning(f"⚠ {fig['set_num']} - {fig['name']}: No year found")
@@ -331,6 +331,172 @@ Remaining with year = -1: {len(incomplete_minifigs) - updated_count}
         
         return updated_count
 
+    def validate_and_repair_dataset(self):
+        """Validate and repair dataset, handling missing or incomplete metadata"""
+        self.logger.info("Starting dataset validation and repair...")
+        
+        # Get all files
+        image_files = list(self.images_dir.glob('*.png')) + list(self.images_dir.glob('*.jpg'))
+        metadata_files = list(self.metadata_dir.glob('*.yaml'))
+        
+        # Create mappings
+        image_ids = {img.stem for img in image_files}
+        metadata_ids = {meta.stem for meta in metadata_files}
+        
+        # Find discrepancies
+        images_without_metadata = image_ids - metadata_ids
+        metadata_without_images = metadata_ids - image_ids
+        
+        self.logger.info(f"""
+Found discrepancies:
+- Images without metadata: {len(images_without_metadata)}
+- Metadata without images: {len(metadata_without_images)}
+""")
+
+        # 1. Handle images without metadata
+        if images_without_metadata:
+            self.logger.info("Attempting to recreate metadata for images without metadata...")
+            headers = {'Authorization': f'key {self.api_key}'}
+            
+            with tqdm(images_without_metadata, desc="Recreating metadata") as pbar:
+                for img_id in pbar:
+                    try:
+                        # Try to get minifig details from API
+                        minifig_response = requests.get(
+                            f"{self.base_url}/minifigs/{img_id}/",
+                            headers=headers,
+                            timeout=10
+                        )
+                        
+                        if minifig_response.status_code == 200:
+                            minifig_data = minifig_response.json()
+                            
+                            # Get year using our existing year-finding logic
+                            year = -1
+                            if minifig_data.get('year'):
+                                try:
+                                    year = int(minifig_data['year'])
+                                except (ValueError, TypeError):
+                                    pass
+                            
+                            if year == -1:
+                                # Try getting year from sets
+                                sets_response = requests.get(
+                                    f"{self.base_url}/minifigs/{img_id}/sets/",
+                                    headers=headers,
+                                    timeout=10
+                                )
+                                if sets_response.status_code == 200:
+                                    sets_data = sets_response.json()
+                                    years = []
+                                    
+                                    for set_info in sets_data.get('results', []):
+                                        set_detail_response = requests.get(
+                                            f"{self.base_url}/sets/{set_info['set_num']}/",
+                                            headers=headers,
+                                            timeout=10
+                                        )
+                                        if set_detail_response.status_code == 200:
+                                            set_detail = set_detail_response.json()
+                                            if set_detail.get('year'):
+                                                try:
+                                                    years.append(int(set_detail['year']))
+                                                except (ValueError, TypeError):
+                                                    continue
+                                    
+                                    if years:
+                                        year = min(years)
+                            
+                            # Create metadata
+                            metadata = {
+                                'minifigure': {
+                                    'set_num': img_id,
+                                    'name': minifig_data.get('name', 'Unknown'),
+                                    'year': year,
+                                    'theme': minifig_data.get('theme_id', 'unknown'),
+                                    'category': 'official'
+                                }
+                            }
+                            
+                            # Save metadata
+                            metadata_path = self.metadata_dir / f"{img_id}.yaml"
+                            with open(metadata_path, 'w') as f:
+                                yaml.dump(metadata, f)
+                                
+                            self.logger.info(f"Created metadata for {img_id}")
+                        else:
+                            self.logger.warning(f"Could not get data for {img_id} from API")
+                            
+                        time.sleep(1)  # Rate limiting
+                        
+                    except Exception as e:
+                        self.logger.error(f"Error processing {img_id}: {e}")
+                        continue
+                    
+                    pbar.update(1)
+
+        # 2. Option to remove orphaned metadata files
+        if metadata_without_images:
+            print("\nFound metadata files without corresponding images:")
+            for meta_id in metadata_without_images:
+                print(f"- {meta_id}")
+            
+            choice = input("\nWould you like to remove these orphaned metadata files? (y/n): ").strip().lower()
+            if choice == 'y':
+                for meta_id in metadata_without_images:
+                    try:
+                        (self.metadata_dir / f"{meta_id}.yaml").unlink()
+                        self.logger.info(f"Removed orphaned metadata: {meta_id}")
+                    except Exception as e:
+                        self.logger.error(f"Error removing {meta_id}: {e}")
+
+        # 3. Validate all remaining metadata files
+        self.logger.info("Validating remaining metadata files...")
+        invalid_metadata = []
+        
+        with tqdm(metadata_files, desc="Validating metadata") as pbar:
+            for meta_file in pbar:
+                try:
+                    with open(meta_file, 'r') as f:
+                        metadata = yaml.safe_load(f)
+                    
+                    # Check required fields
+                    required_fields = ['set_num', 'name', 'year', 'theme', 'category']
+                    if not all(field in metadata.get('minifigure', {}) for field in required_fields):
+                        invalid_metadata.append(meta_file.stem)
+                        
+                except Exception as e:
+                    self.logger.error(f"Error validating {meta_file.name}: {e}")
+                    invalid_metadata.append(meta_file.stem)
+                
+                pbar.update(1)
+        
+        if invalid_metadata:
+            self.logger.warning(f"Found {len(invalid_metadata)} invalid metadata files")
+            print("\nInvalid metadata files:")
+            for meta_id in invalid_metadata:
+                print(f"- {meta_id}")
+            
+            choice = input("\nWould you like to attempt to repair these files? (y/n): ").strip().lower()
+            if choice == 'y':
+                # Attempt to repair invalid metadata files
+                self.update_incomplete_minifigs()
+
+        # Final report
+        self.logger.info(f"""
+Repair Summary:
+--------------
+Initial state:
+- Images without metadata: {len(images_without_metadata)}
+- Metadata without images: {len(metadata_without_images)}
+- Invalid metadata files: {len(invalid_metadata)}
+
+Final state:
+- Metadata recreated: {len(images_without_metadata)}
+- Orphaned metadata removed: {len(metadata_without_images) if 'choice' in locals() and choice == 'y' else 0}
+- Invalid metadata repaired: {len(invalid_metadata) if 'choice' in locals() and choice == 'y' else 0}
+""")
+
     def collect_data(self, limit=None):
         """Main data collection process"""
         try:
@@ -408,33 +574,29 @@ Verification:
 
 def main():
     try:
-        # Ask user what they want to do
         print("\nChoose an option:")
         print("1. Collect new minifigures")
         print("2. Update existing minifigures with missing years")
         print("3. Both collect new and update existing")
+        print("4. Validate and repair dataset")
         
-        choice = input("Enter your choice (1-3): ").strip()
+        choice = input("Enter your choice (1-4): ").strip()
         
         collector = MinifigureDataCollector()
         
         if choice == '1':
-            # Collect new minifigures
             limit_input = input("Enter number of minifigures to collect (press Enter for all): ").strip()
             limit = int(limit_input) if limit_input else None
             collector.collect_data(limit=limit)
-            
         elif choice == '2':
-            # Update existing minifigures
             collector.update_incomplete_minifigs()
-            
         elif choice == '3':
-            # Both collect new and update existing
             limit_input = input("Enter number of minifigures to collect (press Enter for all): ").strip()
             limit = int(limit_input) if limit_input else None
             collector.collect_data(limit=limit)
             collector.update_incomplete_minifigs()
-        
+        elif choice == '4':
+            collector.validate_and_repair_dataset()
         else:
             print("Invalid choice!")
             return
