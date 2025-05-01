@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Lego Scanner</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 0;
+            padding: 20px;
+            background: #f0f2f5;
+        }
+        .container {
+            max-width: 500px;
+            margin: 0 auto;
+            background: white;
+            padding: 20px;
+            border-radius: 10px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+        #video {
+            width: 100%;
+            border-radius: 8px;
+            margin-bottom: 10px;
+        }
+        button {
+            width: 100%;
+            padding: 15px;
+            background: #4285f4;
+            color: white;
+            border: none;
+            border-radius: 8px;
+            font-size: 16px;
+            cursor: pointer;
+            transition: background 0.3s;
+        }
+        button:hover {
+            background: #3367d6;
+        }
+        #result {
+            margin-top: 20px;
+            padding: 15px;
+            border-radius: 8px;
+            background: #f8f9fa;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Lego Minifigure Scanner</h1>
+        <video id="video" autoplay playsinline></video>
+        <button id="capture">Scan Minifigure</button>
+        <div id="result"></div>
+    </div>
+
+    <script>
+        let video = document.getElementById('video');
+        let captureButton = document.getElementById('capture');
+        let resultDiv = document.getElementById('result');
+
+        navigator.mediaDevices.getUserMedia({ 
+            video: { 
+                facingMode: 'environment',
+                width: { ideal: 1280 },
+                height: { ideal: 720 }
+            } 
+        })
+        .then(stream => video.srcObject = stream)
+        .catch(err => {
+            console.error(err);
+            resultDiv.innerHTML = 'Error accessing camera: ' + err.message;
+        });
+
+        captureButton.addEventListener('click', async () => {
+            try {
+                resultDiv.innerHTML = 'Scanning...';
+                
+                let canvas = document.createElement('canvas');
+                canvas.width = video.videoWidth;
+                canvas.height = video.videoHeight;
+                canvas.getContext('2d').drawImage(video, 0, 0);
+                
+                canvas.toBlob(async (blob) => {
+                    let formData = new FormData();
+                    formData.append('image', blob, 'scan.jpg');
+
+                    try {
+                        const response = await fetch('/scan/', {
+                            method: 'POST',
+                            body: formData
+                        });
+                        
+                        const data = await response.json();
+                        
+                        if (data.is_official) {
+                            resultDiv.innerHTML = `
+                                <h3>Official Minifigure Found!</h3>
+                                <p>Name: ${data.name}</p>
+                                <p>ID: ${data.rebrickable_id}</p>
+                                <img src="${data.file_url}" alt="Scanned minifigure" style="max-width: 100%">
+                            `;
+                        } else {
+                            resultDiv.innerHTML = `
+                                <h3>No Match Found</h3>
+                                <p>${data.message}</p>
+                            `;
+                        }
+                    } catch (error) {
+                        resultDiv.innerHTML = 'Error during scan: ' + error.message;
+                    }
+                }, 'image/jpeg');
+            } catch (error) {
+                resultDiv.innerHTML = 'Error capturing image: ' + error.message;
+            }
+        });
+    </script>
+</body>
+</html>
